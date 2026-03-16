@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom"
 import { Fragment, useMemo, useState } from "react"
+import StockForm from "./StockForm"
 
 type Stock = {
   id: number
@@ -21,6 +22,18 @@ type Stock = {
   rsi14?: number | null
   rsi30?: number | null
   rsi60?: number | null
+  minkabu_target_price?: number | null
+  minkabu_target_rating?: string | null
+  minkabu_theoretical_price?: number | null
+  minkabu_individual_price?: number | null
+  minkabu_individual_rating?: string | null
+  minkabu_analyst_price?: number | null
+  minkabu_analyst_rating?: string | null
+  minkabu_fetched_date?: string | null
+  kabutan_total_yield?: number | null
+  kabutan_benefit_yield?: number | null
+  kabutan_dividend_yield?: number | null
+  kabutan_fetched_date?: string | null
 }
 
 type Trade = {
@@ -34,6 +47,7 @@ type Trade = {
 
 type Props = {
   stocks: Stock[]
+  onAdd: (code: string, name: string, industry: string, favorite: boolean) => Promise<void>
   onUpdate: (stock: Stock) => void
   onDelete: (id: number) => void
   onAddTrade: (
@@ -47,7 +61,7 @@ type Props = {
   onDeleteTrade: (stockId: number, createdAt: string) => Promise<void>
 }
 
-export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onFetchTrades, onDeleteTrade }: Props) {
+export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTrade, onFetchTrades, onDeleteTrade }: Props) {
   const [editedRows, setEditedRows] = useState<Record<number, Stock>>({})
   const [sortKey, setSortKey] = useState<keyof Stock>("code")
   const [sortAsc, setSortAsc] = useState(true)
@@ -56,7 +70,13 @@ export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onF
   const [sellTargetOnly, setSellTargetOnly] = useState(false)
   const [industryFilter, setIndustryFilter] = useState("")
   const [keyword, setKeyword] = useState("")
+  const [targetRatingFilter, setTargetRatingFilter] = useState<string[]>([])
+  const [individualRatingFilter, setIndividualRatingFilter] = useState<string[]>([])
+  const [analystRatingFilter, setAnalystRatingFilter] = useState<string[]>([])
+  const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
+  const [isFiltersVisible, setIsFiltersVisible] = useState(true)
   const [tradeFormOpenId, setTradeFormOpenId] = useState<number | null>(null)
+  const [isCompactView, setIsCompactView] = useState(false)
   const [tradeDate, setTradeDate] = useState("")
   const [tradeSide, setTradeSide] = useState<"buy" | "sell">("buy")
   const [tradeQuantity, setTradeQuantity] = useState("")
@@ -84,6 +104,16 @@ export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onF
           s.code.includes(keyword) ||
           s.name.includes(keyword)
       )
+    }
+
+    if (targetRatingFilter.length > 0) {
+      result = result.filter((s) => targetRatingFilter.includes(s.minkabu_target_rating ?? ""))
+    }
+    if (individualRatingFilter.length > 0) {
+      result = result.filter((s) => individualRatingFilter.includes(s.minkabu_individual_rating ?? ""))
+    }
+    if (analystRatingFilter.length > 0) {
+      result = result.filter((s) => analystRatingFilter.includes(s.minkabu_analyst_rating ?? ""))
     }
 
     const isBuyTarget = (s: Stock) =>
@@ -142,7 +172,19 @@ export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onF
     })
 
     return result
-  }, [stocks, sortKey, sortAsc, favoriteOnly, buyTargetOnly, sellTargetOnly, industryFilter, keyword])
+  }, [
+    stocks,
+    sortKey,
+    sortAsc,
+    favoriteOnly,
+    buyTargetOnly,
+    sellTargetOnly,
+    industryFilter,
+    keyword,
+    targetRatingFilter,
+    individualRatingFilter,
+    analystRatingFilter,
+  ])
 
   const handleSort = (key: keyof Stock) => {
     if (sortKey === key) {
@@ -187,6 +229,20 @@ export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onF
   const industries = Array.from(
     new Set(stocks.map((s) => s.industry).filter(Boolean))
   )
+  const ratingOptions = Array.from(
+    new Set(
+      stocks
+        .flatMap((s) => [
+          s.minkabu_target_rating ?? null,
+          s.minkabu_individual_rating ?? null,
+          s.minkabu_analyst_rating ?? null,
+        ])
+        .filter(Boolean)
+    )
+  ) as string[]
+  const sortedRatingOptions = ["強買い", "やや買い", "買い", "中立", "やや売り", "売り", "強売り", "割安", "割高"]
+    .filter((r) => ratingOptions.includes(r))
+    .concat(ratingOptions.filter((r) => !["強買い", "やや買い", "買い", "中立", "やや売り", "売り", "強売り", "割安", "割高"].includes(r)))
 
   const fmtNumber = (value?: number | null, digits = 2) => {
     if (value === null || value === undefined) return "-"
@@ -201,9 +257,26 @@ export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onF
     return Number(value).toFixed(digits)
   }
 
+  const fmtPercent = (value?: number | null, digits = 2) => {
+    if (value === null || value === undefined) return "-"
+    return `${Number(value).toFixed(digits)}%`
+  }
+
   const fmtDate = (value?: string | null) => {
     if (!value) return ""
     return value.slice(0, 10)
+  }
+
+  const fmtDiff = (value?: number | null, base?: number | null) => {
+    if (value == null || base == null) return "-"
+    const diff = value - base
+    const sign = diff > 0 ? "+" : ""
+    return `${sign}${fmtNumber(diff, 0)}`
+  }
+
+  const getTheorySignal = (theory?: number | null, current?: number | null) => {
+    if (theory == null || current == null) return null
+    return theory > current ? "sell" : "buy"
   }
 
   const getChangeClass = (value?: number | null) => {
@@ -218,6 +291,22 @@ export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onF
     if (value <= 25) return "rsi-low"
     if (value >= 65) return "rsi-high"
     return ""
+  }
+
+  const getRatingClass = (value?: string | null) => {
+    if (!value) return ""
+    if (["強買い", "やや買い", "買い"].includes(value)) return "rating-buy"
+    if (["強売り", "やや売り", "売り"].includes(value)) return "rating-sell"
+    if (["中立", "割安", "割高"].includes(value)) return "rating-neutral"
+    return ""
+  }
+
+  const toggleRating = (current: string[], value: string, setter: (next: string[]) => void) => {
+    if (current.includes(value)) {
+      setter(current.filter((v) => v !== value))
+    } else {
+      setter([...current, value])
+    }
   }
 
   const openTradeForm = async (stockId: number) => {
@@ -251,76 +340,217 @@ export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onF
 
   return (
     <div className="card">
-      <h2>銘柄一覧</h2>
-
       {/* フィルタエリア */}
-      <div style={{ marginBottom: 15 }}>
-        <input
-          placeholder="コード・銘柄名検索"
-          value={keyword}
-          onChange={(e) => setKeyword(e.target.value)}
-        />
-
-        <select
-          value={industryFilter}
-          onChange={(e) => setIndustryFilter(e.target.value)}
+      <section className="panel">
+      <div className="panel-header">
+        <h3 className="panel-title">{"\u30d5\u30a3\u30eb\u30bf"}</h3>
+        <button
+          type="button"
+          className="panel-toggle"
+          onClick={() => setIsFiltersVisible((prev) => !prev)}
         >
-          <option value="">全業種</option>
-          {industries.map((ind) => (
-            <option key={ind} value={ind}>
-              {ind}
-            </option>
-          ))}
-        </select>
-
-        <label style={{ marginLeft: 10 }}>
-          <input
-            type="checkbox"
-            checked={favoriteOnly}
-            onChange={(e) => setFavoriteOnly(e.target.checked)}
-          />
-          ★のみ
-        </label>
-        <label style={{ marginLeft: 10 }}>
-          <input
-            type="checkbox"
-            checked={buyTargetOnly}
-            onChange={(e) => setBuyTargetOnly(e.target.checked)}
-          />
-          買い狙い
-        </label>
-        <label style={{ marginLeft: 10 }}>
-          <input
-            type="checkbox"
-            checked={sellTargetOnly}
-            onChange={(e) => setSellTargetOnly(e.target.checked)}
-          />
-          売り狙い
-        </label>
+          {isFiltersVisible ? "\u975e\u8868\u793a" : "\u8868\u793a"}
+        </button>
       </div>
-      <div className="table-wrapper">
-       <table className="table">
+      {isFiltersVisible && (
+<div className="filters">
+        <div className="filter-row">
+          <div className="filter-block">
+            <label className="filter-label">検索</label>
+            <input
+              placeholder="コード・銘柄名"
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+            />
+          </div>
+          <div className="filter-block">
+            <label className="filter-label">業種</label>
+            <select
+              value={industryFilter}
+              onChange={(e) => setIndustryFilter(e.target.value)}
+            >
+              <option value="">全業種</option>
+              {industries.map((ind) => (
+                <option key={ind} value={ind}>
+                  {ind}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="filter-block filter-inline">
+            <label className="filter-label">表示</label>
+            <label className="filter-check">
+              <input
+                type="checkbox"
+                checked={favoriteOnly}
+                onChange={(e) => setFavoriteOnly(e.target.checked)}
+              />
+              ★のみ
+            </label>
+          </div>
+          <button
+            type="button"
+            className="filter-toggle"
+            onClick={() => setIsAdvancedOpen((prev) => !prev)}
+          >
+            {isAdvancedOpen ? "詳細フィルタを閉じる" : "詳細フィルタを開く"}
+          </button>
+
+        </div>
+
+        {isAdvancedOpen && (
+          <div className="filter-advanced">
+            <div className="filter-chip-group">
+              <span className="filter-chip-label">{"\u30bf\u30fc\u30b2\u30c3\u30c8"}</span>
+              <label className="filter-check">
+                <input
+                  type="checkbox"
+                  checked={buyTargetOnly}
+                  onChange={(e) => setBuyTargetOnly(e.target.checked)}
+                />
+                {"\u8cb7\u3044\u72d9\u3044"}
+              </label>
+              <label className="filter-check">
+                <input
+                  type="checkbox"
+                  checked={sellTargetOnly}
+                  onChange={(e) => setSellTargetOnly(e.target.checked)}
+                />
+                {"\u58f2\u308a\u72d9\u3044"}
+              </label>
+            </div>
+            <div className="filter-chip-group">
+              <span className="filter-chip-label">目標評価</span>
+              {sortedRatingOptions.map((r) => (
+                <button
+                  key={`target-${r}`}
+                  type="button"
+                  className={`filter-chip ${targetRatingFilter.includes(r) ? "is-active" : ""}`}
+                  onClick={() => toggleRating(targetRatingFilter, r, setTargetRatingFilter)}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
+            <div className="filter-chip-group">
+              <span className="filter-chip-label">個人評価</span>
+              {sortedRatingOptions.map((r) => (
+                <button
+                  key={`individual-${r}`}
+                  type="button"
+                  className={`filter-chip ${individualRatingFilter.includes(r) ? "is-active" : ""}`}
+                  onClick={() => toggleRating(individualRatingFilter, r, setIndividualRatingFilter)}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
+            <div className="filter-chip-group">
+              <span className="filter-chip-label">アナ評価</span>
+              {sortedRatingOptions.map((r) => (
+                <button
+                  key={`analyst-${r}`}
+                  type="button"
+                  className={`filter-chip ${analystRatingFilter.includes(r) ? "is-active" : ""}`}
+                  onClick={() => toggleRating(analystRatingFilter, r, setAnalystRatingFilter)}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+      )}
+    </section>
+
+      <StockForm onAdd={onAdd} />
+      <button
+        type="button"
+        className="filter-toggle"
+        onClick={() => setIsCompactView((prev) => !prev)}
+      >
+        {isCompactView ? "詳細モード" : "簡易モード"}
+      </button>
+<div className="table-wrapper">
+       <table className={`table table-sticky${isCompactView ? " compact-view" : ""}`}>
         <thead>
-          <tr>
-            <th onClick={() => handleSort("favorite")}>★</th>
-            <th onClick={() => handleSort("code")}>コード</th>
-            <th onClick={() => handleSort("name")}>銘柄名</th>
-            <th onClick={() => handleSort("industry")}>業種</th>
-            <th onClick={() => handleSort("latest_close")}>最新株価</th>
-            <th onClick={() => handleSort("buy_price")}>買い狙い価格</th>
-            <th onClick={() => handleSort("sell_price")}>売り狙い価格</th>
-            <th onClick={() => handleSort("holding_qty")}>保有株数</th>
-            <th onClick={() => handleSort("avg_buy_price")}>買い平均価格</th>
-            <th onClick={() => handleSort("holding_value")}>保有価値</th>
-            <th onClick={() => handleSort("unrealized_pnl")}>現株価損益</th>
-            <th onClick={() => handleSort("realized_pnl")}>確定損益</th>
-            <th onClick={() => handleSort("change_value")}>前日比</th>
-            <th onClick={() => handleSort("change_percent")}>前日比%</th>
+          
+          {isCompactView ? (
+          <tr className="sub-header">
+            <th className="sticky-col sticky-1" onClick={() => handleSort("name")}>{"銘柄名"}</th>
+            <th onClick={() => handleSort("latest_close")}>{"最新株価"}</th>
+            <th onClick={() => handleSort("holding_value")}>{"保有価値"}</th>
+            <th onClick={() => handleSort("unrealized_pnl")}>{"含み損益"}</th>
+            <th onClick={() => handleSort("change_percent")}>{"前日比率"}</th>
             <th onClick={() => handleSort("rsi14")}>RSI14</th>
-            <th onClick={() => handleSort("rsi30")}>RSI30</th>
-            <th onClick={() => handleSort("rsi60")}>RSI60</th>
-            <th>操作</th>
+            <th onClick={() => handleSort("minkabu_target_rating")}>{"目標評価"}</th>
+            <th onClick={() => handleSort("minkabu_target_price")}>{"目標株価"}</th>
+            <th onClick={() => handleSort("kabutan_total_yield")}>{"配当＋優待"}</th>
+            <th className="sticky-col-right">{"詳細"}</th>
           </tr>
+        ) : (
+          <tr className="sub-header">
+            <th className="sticky-col sticky-1" onClick={() => handleSort("favorite")}>{"\u2605"}</th>
+            <th className="sticky-col sticky-2">
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("code")}>{"銘柄コード"}</button>
+                <button type="button" className="header-action header-muted" onClick={() => handleSort("industry")}>{"業種"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("name")}>{"銘柄名"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("latest_close")}>{"最新株価 "}<span className="header-muted">(yyyy/mm/dd)</span></button>
+                <button type="button" className="header-action" onClick={() => handleSort("buy_price")}>{"買い狙い価格"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("sell_price")}>{"売り狙い価格"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("holding_qty")}>{"保有株数"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("holding_value")}>{"保有価値"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("avg_buy_price")}>{"買い平均価格"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("unrealized_pnl")}>{"含み損益"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("realized_pnl")}>{"確定損益"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("change_value")}>{"前日増減"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("change_percent")}>{"前日比率"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("rsi14")}>RSI14</button>
+                <button type="button" className="header-action" onClick={() => handleSort("rsi30")}>RSI30</button>
+                <button type="button" className="header-action" onClick={() => handleSort("rsi60")}>RSI60</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("minkabu_target_rating")}>{"目標評価：目標株価"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("minkabu_theoretical_price")}>{"理論株価"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("minkabu_individual_rating")}>{"個人評価：個人予想株価"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("minkabu_analyst_rating")}>{"アナリスト評価：予想株価"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("kabutan_dividend_yield")}>{"配当利回り"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("kabutan_benefit_yield")}>{"優待利回り"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("kabutan_total_yield")}>{"配当＋優待"}</button>
+                <button type="button" className="header-action header-muted" onClick={() => handleSort("kabutan_fetched_date")}>{"取得日"}</button>
+              </div>
+            </th>
+            <th className="sticky-col-right">{"操作"}</th>
+          </tr>
+        )}
         </thead>
 
         <tbody>
@@ -331,7 +561,26 @@ export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onF
             return (
               <Fragment key={stock.id}>
                 <tr style={{ background: isEdited ? "#fff8dc" : "" }}>
-                  <td>
+                  {isCompactView ? (
+                    <>
+<td className="sticky-col sticky-1">{row.name}</td>
+                      <td><span className="highlight-value">{fmtNumber(stock.latest_close)}</span></td>
+                      <td><span className="highlight-value">{fmtNumber(stock.holding_value)}</span></td>
+                      <td className={getChangeClass(stock.unrealized_pnl)}>{fmtNumber(stock.unrealized_pnl)}</td>
+                      <td className={getChangeClass(stock.change_percent)}>{stock.change_percent == null ? "-" : `${fmtFixed(stock.change_percent)}%`}</td>
+                      <td className={getRsiClass(stock.rsi14)}>{fmtFixed(stock.rsi14)}</td>
+                      <td className={getRatingClass(stock.minkabu_target_rating)}>{stock.minkabu_target_rating ?? "-"}</td>
+                      <td>{fmtNumber(stock.minkabu_target_price, 0)}</td>
+                      <td>{fmtPercent(stock.kabutan_total_yield, 2)}</td>
+                      <td className="sticky-col-right">
+                        <Link className="detail-link" to={`/stocks/${stock.id}`}>
+                          {"詳細"}
+                        </Link>
+                      </td>
+                    </>
+                  ) : (
+                    <>
+<td className="sticky-col sticky-1">
                     <input
                       type="checkbox"
                       checked={row.favorite || false}
@@ -341,90 +590,168 @@ export default function StockTable({ stocks, onUpdate, onDelete, onAddTrade, onF
                     />
                   </td>
 
-                  <td>
-                    <input
-                      value={row.code}
-                      onChange={(e) =>
-                        handleChange(stock.id, "code", e.target.value)
-                      }
-                    />
+                  <td className="sticky-col sticky-2">
+                    <div className="cell-stack compact-stack">
+                      <input
+                        className="cell-input cell-code"
+                        value={row.code}
+                        onChange={(e) =>
+                          handleChange(stock.id, "code", e.target.value)
+                        }
+                      />
+                      <input
+                        className="cell-input cell-muted"
+                        value={row.industry || ""}
+                        onChange={(e) =>
+                          handleChange(stock.id, "industry", e.target.value)
+                        }
+                      />
+                      <input
+                        className="cell-input cell-name"
+                        value={row.name}
+                        onChange={(e) =>
+                          handleChange(stock.id, "name", e.target.value)
+                        }
+                      />
+                    </div>
                   </td>
 
                   <td>
-                    <input
-                      value={row.name}
-                      onChange={(e) =>
-                        handleChange(stock.id, "name", e.target.value)
-                      }
-                    />
-                  </td>
-
-                  <td>
-                    <input
-                      value={row.industry || ""}
-                      onChange={(e) =>
-                        handleChange(stock.id, "industry", e.target.value)
-                      }
-                    />
-                  </td>
-
-                  <td>
-                    <div>{fmtNumber(stock.latest_close)}</div>
-                    <small>{fmtDate(stock.latest_date)}</small>
-                  </td>
-                  <td>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={row.buy_price ?? ""}
-                      onChange={(e) => handleNumberChange(stock.id, "buy_price", e.target.value)}
-                    />
+                    <div className="cell-stack compact-stack">
+                      <div className="cell-line highlight-line">
+                        <span className="highlight-value">{fmtNumber(stock.latest_close)}</span>
+                        <small className="cell-date">{fmtDate(stock.latest_date)}</small>
+                      </div>
+                      <div className="cell-line cell-input-row">
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={row.buy_price ?? ""}
+                          onChange={(e) => handleNumberChange(stock.id, "buy_price", e.target.value)}
+                        />
+                        <span className="cell-tag buy">{"\u8cb7\u72d9"}</span>
+                      </div>
+                      <div className="cell-line cell-input-row">
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={row.sell_price ?? ""}
+                          onChange={(e) => handleNumberChange(stock.id, "sell_price", e.target.value)}
+                        />
+                        <span className="cell-tag sell">{"\u58f2\u72d9"}</span>
+                      </div>
+                    </div>
                   </td>
                   <td>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={row.sell_price ?? ""}
-                      onChange={(e) => handleNumberChange(stock.id, "sell_price", e.target.value)}
-                    />
+                    <div className="cell-stack compact-stack">
+                      <div className="cell-line">{fmtNumber(stock.holding_qty, 0)}</div>
+                      <div className="cell-line highlight-line"><span className="highlight-value">{fmtNumber(stock.holding_value)}</span></div>
+                    </div>
                   </td>
-                  <td>{fmtNumber(stock.holding_qty, 0)}</td>
-                  <td>{fmtNumber(stock.avg_buy_price)}</td>
-                  <td>{fmtNumber(stock.holding_value)}</td>
-                  <td className={getChangeClass(stock.unrealized_pnl)}>{fmtNumber(stock.unrealized_pnl)}</td>
-                  <td className={getChangeClass(stock.realized_pnl)}>{fmtNumber(stock.realized_pnl)}</td>
-                  <td className={getChangeClass(stock.change_value)}>{fmtNumber(stock.change_value)}</td>
-                  <td className={getChangeClass(stock.change_percent)}>
-                    {stock.change_percent == null ? "-" : `${fmtFixed(stock.change_percent)}%`}
-                  </td>
-                  <td className={getRsiClass(stock.rsi14)}>{fmtFixed(stock.rsi14)}</td>
-                  <td className={getRsiClass(stock.rsi30)}>{fmtFixed(stock.rsi30)}</td>
-                  <td className={getRsiClass(stock.rsi60)}>{fmtFixed(stock.rsi60)}</td>
-
                   <td>
-                    <Link className="detail-link" to={`/stocks/${stock.id}`}>
-                      詳細
-                    </Link>
-
-                    <button
-                      onClick={() => handleSave(stock.id)}
-                      disabled={!isEdited}
-                    >
-                      💾
-                    </button>
-
-                    <button onClick={() => onDelete(stock.id)}>
-                      🗑
-                    </button>
-                    <button onClick={() => void openTradeForm(stock.id)}>
-                      取引履歴追加
-                    </button>
+                    <div className="cell-stack compact-stack">
+                      <div className="cell-line">{fmtNumber(stock.avg_buy_price)}</div>
+                      <div className={`cell-line ${getChangeClass(stock.unrealized_pnl)}`}>{fmtNumber(stock.unrealized_pnl)}</div>
+                      <div className={`cell-line ${getChangeClass(stock.realized_pnl)}`}>{fmtNumber(stock.realized_pnl)}</div>
+                    </div>
                   </td>
+                  <td>
+                    <div className="cell-stack compact-stack">
+                      <div className={`cell-line ${getChangeClass(stock.change_value)}`}>
+                        {fmtNumber(stock.change_value)}
+                      </div>
+                      <div className={`cell-line ${getChangeClass(stock.change_percent)}`}>
+                        {stock.change_percent == null ? "-" : `${fmtFixed(stock.change_percent)}%`}
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="cell-stack compact-stack">
+                      <div className={`cell-line ${getRsiClass(stock.rsi14)}`}>{fmtFixed(stock.rsi14)}</div>
+                      <div className={`cell-line ${getRsiClass(stock.rsi30)}`}>{fmtFixed(stock.rsi30)}</div>
+                      <div className={`cell-line ${getRsiClass(stock.rsi60)}`}>{fmtFixed(stock.rsi60)}</div>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="cell-stack compact-stack">
+                      <div className="cell-line">
+                        <span className={`cell-badge ${getRatingClass(stock.minkabu_target_rating)}`}>{stock.minkabu_target_rating ?? "-"}</span>
+                        <span>{fmtNumber(stock.minkabu_target_price, 0)}</span>
+                        <span className={`cell-diff ${getChangeClass(stock.minkabu_target_price != null && stock.latest_close != null ? stock.minkabu_target_price - stock.latest_close : null)}`}>
+                          {fmtDiff(stock.minkabu_target_price, stock.latest_close)}
+                        </span>
+                      </div>
+                      <div className="cell-line">
+                        <span className={`cell-badge ${getTheorySignal(stock.minkabu_theoretical_price, stock.latest_close) === "sell" ? "rating-sell" : getTheorySignal(stock.minkabu_theoretical_price, stock.latest_close) === "buy" ? "rating-buy" : ""}`}>
+                          {getTheorySignal(stock.minkabu_theoretical_price, stock.latest_close) === "sell" ? "\u58f2\u308a" : getTheorySignal(stock.minkabu_theoretical_price, stock.latest_close) === "buy" ? "\u8cb7\u3044" : "-"}
+                        </span>
+                        <span>{fmtNumber(stock.minkabu_theoretical_price, 0)}</span>
+                        <span className={`cell-diff ${getChangeClass(stock.minkabu_theoretical_price != null && stock.latest_close != null ? stock.minkabu_theoretical_price - stock.latest_close : null)}`}>
+                          {fmtDiff(stock.minkabu_theoretical_price, stock.latest_close)}
+                        </span>
+                      </div>
+                      <div className="cell-line">
+                        <span className={`cell-badge ${getRatingClass(stock.minkabu_individual_rating)}`}>{stock.minkabu_individual_rating ?? "-"}</span>
+                        <span>{fmtNumber(stock.minkabu_individual_price, 0)}</span>
+                        <span className={`cell-diff ${getChangeClass(stock.minkabu_individual_price != null && stock.latest_close != null ? stock.minkabu_individual_price - stock.latest_close : null)}`}>
+                          {fmtDiff(stock.minkabu_individual_price, stock.latest_close)}
+                        </span>
+                      </div>
+                      <div className="cell-line">
+                        <span className={`cell-badge ${getRatingClass(stock.minkabu_analyst_rating)}`}>{stock.minkabu_analyst_rating ?? "-"}</span>
+                        <span className="cell-date">{fmtDate(stock.minkabu_fetched_date)}</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="cell-stack compact-stack">
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"配当"}</span>
+                        <span>{fmtPercent(stock.kabutan_dividend_yield, 2)}</span>
+                      </div>
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"優待"}</span>
+                        <span>{fmtPercent(stock.kabutan_benefit_yield, 2)}</span>
+                      </div>
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"合計"}</span>
+                        <span>{fmtPercent(stock.kabutan_total_yield, 2)}</span>
+                      </div>
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"取得日"}</span>
+                        <span className="cell-date">{fmtDate(stock.kabutan_fetched_date)}</span>
+                      </div>
+                    </div>
+                  </td>
+
+                  <td className="sticky-col-right">
+                    <div className="action-stack">
+                      <Link className="detail-link" to={`/stocks/${stock.id}`}>
+                        {"\u8a73\u7d30"}
+                      </Link>
+                      <button
+                        onClick={() => handleSave(stock.id)}
+                        disabled={!isEdited}
+                        aria-label="保存"
+                        title="保存"
+                      >
+                        💾
+                      </button>
+                      <button onClick={() => onDelete(stock.id)} aria-label="削除" title="削除">
+                        🗑
+                      </button>
+                      <button onClick={() => void openTradeForm(stock.id)} aria-label="取引履歴" title="取引履歴">
+                        📒
+                      </button>
+                    </div>
+                  </td>
+                    </>
+                  )}
                 </tr>
 
                 {tradeFormOpenId === stock.id && (
                   <tr key={`trade-form-${stock.id}`} className="trade-form-row">
-                    <td colSpan={18}>
+                    <td colSpan={10}>
                       <div className="trade-form">
                         <input
                           type="date"

@@ -1,5 +1,8 @@
 from app.database import get_connection
 from typing import Optional
+import re
+import requests
+from bs4 import BeautifulSoup
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
@@ -73,6 +76,8 @@ def _build_trade_metrics(trade_rows):
 
 def get_all_stocks():
     con = get_connection()
+    _ensure_minkabu_table(con)
+    _ensure_kabutan_table(con)
     rows = con.execute("""
         WITH latest_daily AS (
             SELECT
@@ -91,6 +96,38 @@ def get_all_stocks():
                     ORDER BY date DESC
                 ) AS rn
             FROM daily_prices
+        ),
+        latest_minkabu AS (
+            SELECT
+                stock_id,
+                target_price,
+                target_rating,
+                theoretical_price,
+                individual_price,
+                individual_rating,
+                analyst_price,
+                analyst_rating,
+                fetched_date,
+                updated_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY stock_id
+                    ORDER BY fetched_date DESC, updated_at DESC
+                ) AS rn
+            FROM minkabu_forecasts
+        ),
+        latest_kabutan AS (
+            SELECT
+                stock_id,
+                yield_total,
+                yield_benefit,
+                yield_dividend,
+                fetched_date,
+                updated_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY stock_id
+                    ORDER BY fetched_date DESC, updated_at DESC
+                ) AS rn
+            FROM kabutan_yields
         )
         SELECT
             s.id,
@@ -109,11 +146,29 @@ def get_all_stocks():
             END AS change_percent,
             ld.rsi14,
             ld.rsi30,
-            ld.rsi60
+            ld.rsi60,
+            lm.target_price,
+            lm.target_rating,
+            lm.theoretical_price,
+            lm.individual_price,
+            lm.individual_rating,
+            lm.analyst_price,
+            lm.analyst_rating,
+            lm.fetched_date,
+            lk.yield_total,
+            lk.yield_benefit,
+            lk.yield_dividend,
+            lk.fetched_date
         FROM stocks s
         LEFT JOIN latest_daily ld
             ON s.id = ld.stock_id
            AND ld.rn = 1
+        LEFT JOIN latest_minkabu lm
+            ON s.id = lm.stock_id
+           AND lm.rn = 1
+        LEFT JOIN latest_kabutan lk
+            ON s.id = lk.stock_id
+           AND lk.rn = 1
         ORDER BY favorite DESC, code
     """).fetchall()
     trade_rows = con.execute("""
@@ -176,6 +231,18 @@ def get_all_stocks():
             "rsi14": r[11],
             "rsi30": r[12],
             "rsi60": r[13],
+            "minkabu_target_price": r[14],
+            "minkabu_target_rating": r[15],
+            "minkabu_theoretical_price": r[16],
+            "minkabu_individual_price": r[17],
+            "minkabu_individual_rating": r[18],
+            "minkabu_analyst_price": r[19],
+            "minkabu_analyst_rating": r[20],
+            "minkabu_fetched_date": r[21],
+            "kabutan_total_yield": r[22],
+            "kabutan_benefit_yield": r[23],
+            "kabutan_dividend_yield": r[24],
+            "kabutan_fetched_date": r[25],
         }
         for r in rows
     ]
@@ -765,6 +832,141 @@ def _normalize_dividend_yield(value):
     return val
 
 
+def _ensure_minkabu_table(con):
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS minkabu_forecasts (
+            stock_id INTEGER,
+            target_price DOUBLE,
+            target_rating VARCHAR,
+            theoretical_price DOUBLE,
+            individual_price DOUBLE,
+            individual_rating VARCHAR,
+            analyst_price DOUBLE,
+            analyst_rating VARCHAR,
+            fetched_date DATE,
+            source_url VARCHAR,
+            updated_at TIMESTAMP,
+            UNIQUE (stock_id, fetched_date)
+        )
+        """
+    )
+
+
+def _ensure_kabutan_table(con):
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kabutan_yields (
+            stock_id INTEGER,
+            yield_total DOUBLE,
+            yield_benefit DOUBLE,
+            yield_dividend DOUBLE,
+            fetched_date DATE,
+            source_url VARCHAR,
+            updated_at TIMESTAMP,
+            UNIQUE (stock_id, fetched_date)
+        )
+        """
+    )
+
+
+def _latest_value(values):
+    if not values:
+        return None
+    for value in reversed(values):
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip() == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_minkabu_prices(payload: dict):
+    stock = payload.get("stock") or {}
+    return {
+        "target_price": _latest_value(stock.get("mk_prices")),
+        "individual_price": _latest_value(stock.get("picks_prices")),
+        "theoretical_price": _latest_value(stock.get("theoretic_prices")),
+    }
+
+
+def _extract_minkabu_ratings(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    target_rating = None
+    target_box = soup.select_one(".md_target_box_group .md_target_box")
+    if target_box:
+        header_plate = target_box.select_one(".md_target_box_header .md_picksPlate .value")
+        if header_plate:
+            target_rating = header_plate.get_text(strip=True)
+
+    def find_body_rating(label_text: str):
+        for item in soup.select(".md_target_box_body .md_box"):
+            label = item.select_one(".label")
+            if not label:
+                continue
+            if label.get_text(strip=True) != label_text:
+                continue
+            plate = item.select_one(".md_picksPlate")
+            if plate:
+                return plate.get_text(strip=True)
+        return None
+
+    return {
+        "target_rating": target_rating,
+        "individual_rating": find_body_rating("個人予想"),
+        "analyst_rating": find_body_rating("アナリスト"),
+    }
+
+
+def _extract_kabutan_yields(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.select_one("table.stock_yutai_top_1")
+    if table:
+        tds = table.select("tr td")
+        if len(tds) >= 3:
+            values = []
+            for td in tds[:3]:
+                text = td.get_text(strip=True).replace("％", "%")
+                text = text.replace("．", ".").replace("・", ".")
+                if text in ("-", "－", "―", "--", "—"):
+                    values.append(0.0)
+                    continue
+                match = re.search(r"([0-9]+(?:\.[0-9]+)?)%", text)
+                values.append(float(match.group(1)) if match else None)
+            return {
+                "yield_total": values[0],
+                "yield_benefit": values[1],
+                "yield_dividend": values[2],
+            }
+
+    return {"yield_total": None, "yield_benefit": None, "yield_dividend": None}
+
+
+def _extract_kabutan_dividend_from_stock(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        headers = [th.get_text(strip=True) for th in table.find_all("th")]
+        if "PER" in "".join(headers) and "利回り" in "".join(headers):
+            for tr in table.find_all("tr"):
+                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if not tds:
+                    continue
+                # columns: PER, PBR, 利回り, 信用倍率, 時価総額 ...
+                if len(tds) >= 3:
+                    text = tds[2].replace("％", "%").replace("．", ".").replace("・", ".")
+                    if text in ("-", "－", "―", "--", "—"):
+                        return 0.0
+                    match = re.search(r"([0-9]+(?:\.[0-9]+)?)%", text)
+                    if match:
+                        return float(match.group(1))
+            break
+    return None
+
+
 def update_stock_info(stock_id: int, code: str):
     info = {}
     for ticker_symbol in _candidate_ticker_symbols(code):
@@ -869,6 +1071,230 @@ def get_stock_info(stock_id: int):
         "currency": row[12],
         "country": row[13],
         "updated_at": row[14],
+    }
+
+
+def update_minkabu_forecasts_all():
+    con = get_connection()
+    _ensure_minkabu_table(con)
+    stock_rows = con.execute("""
+        SELECT id, code
+        FROM stocks
+        ORDER BY id
+    """).fetchall()
+
+    today = datetime.today().date()
+    updated = 0
+    skipped = 0
+    failed = []
+
+    for stock_id, code in stock_rows:
+        exists = con.execute(
+            """
+            SELECT 1
+            FROM minkabu_forecasts
+            WHERE stock_id = ? AND fetched_date = ?
+            """,
+            [stock_id, today],
+        ).fetchone()
+        if exists:
+            skipped += 1
+            continue
+
+        code_text = str(code or "").strip()
+        if not code_text:
+            failed.append({"stock_id": stock_id, "code": code, "reason": "Missing code"})
+            continue
+
+        minkabu_code = re.sub(r"\.T$", "", code_text)
+        analysis_url = f"https://minkabu.jp/stock/{minkabu_code}/analysis"
+        json_url = f"https://assets.minkabu.jp/jsons/stock-jam/stocks/{minkabu_code}/lump.json"
+
+        prices = {}
+        ratings = {}
+
+        try:
+            json_res = requests.get(
+                json_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=20,
+            )
+            if json_res.status_code == 200:
+                prices = _extract_minkabu_prices(json_res.json())
+            else:
+                failed.append({"stock_id": stock_id, "code": code_text, "reason": f"JSON HTTP {json_res.status_code}"})
+                continue
+        except Exception as e:
+            failed.append({"stock_id": stock_id, "code": code_text, "reason": f"JSON error: {e}"})
+            continue
+
+        try:
+            html_res = requests.get(
+                analysis_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=20,
+            )
+            if html_res.status_code == 200:
+                ratings = _extract_minkabu_ratings(html_res.text)
+            else:
+                failed.append({"stock_id": stock_id, "code": code_text, "reason": f"HTML HTTP {html_res.status_code}"})
+                continue
+        except Exception as e:
+            failed.append({"stock_id": stock_id, "code": code_text, "reason": f"HTML error: {e}"})
+            continue
+
+        data = {
+            "target_price": prices.get("target_price"),
+            "target_rating": ratings.get("target_rating"),
+            "theoretical_price": prices.get("theoretical_price"),
+            "individual_price": prices.get("individual_price"),
+            "individual_rating": ratings.get("individual_rating"),
+            "analyst_price": None,
+            "analyst_rating": ratings.get("analyst_rating"),
+        }
+
+        if all(value is None for value in data.values()):
+            failed.append({"stock_id": stock_id, "code": code_text, "reason": "Parse failed"})
+            continue
+
+        con.execute(
+            """
+            INSERT OR REPLACE INTO minkabu_forecasts
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                stock_id,
+                data.get("target_price"),
+                data.get("target_rating"),
+                data.get("theoretical_price"),
+                data.get("individual_price"),
+                data.get("individual_rating"),
+                data.get("analyst_price"),
+                data.get("analyst_rating"),
+                today,
+                analysis_url,
+                datetime.now(),
+            ],
+        )
+        updated += 1
+
+    con.commit()
+    con.close()
+
+    return {
+        "message": "Minkabu forecasts updated",
+        "total_stocks": len(stock_rows),
+        "updated_stocks": updated,
+        "skipped_stocks": skipped,
+        "failed": failed,
+    }
+
+
+def update_kabutan_yields_all():
+    con = get_connection()
+    _ensure_kabutan_table(con)
+    stock_rows = con.execute("""
+        SELECT id, code
+        FROM stocks
+        ORDER BY id
+    """).fetchall()
+
+    today = datetime.today().date()
+    updated = 0
+    skipped = 0
+    failed = []
+
+    for stock_id, code in stock_rows:
+        exists = con.execute(
+            """
+            SELECT 1
+            FROM kabutan_yields
+            WHERE stock_id = ? AND fetched_date = ?
+            """,
+            [stock_id, today],
+        ).fetchone()
+        if exists:
+            skipped += 1
+            continue
+
+        code_text = str(code or "").strip()
+        if not code_text:
+            failed.append({"stock_id": stock_id, "code": code, "reason": "Missing code"})
+            continue
+
+        kabutan_code = re.sub(r"\\D", "", code_text)
+        if not kabutan_code:
+            failed.append({"stock_id": stock_id, "code": code_text, "reason": "Invalid code"})
+            continue
+
+        yutai_url = f"https://kabutan.jp/stock/yutai?code={kabutan_code}"
+        stock_url = f"https://kabutan.jp/stock/?code={kabutan_code}"
+        try:
+            res = requests.get(
+                yutai_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=20,
+            )
+        except Exception as e:
+            failed.append({"stock_id": stock_id, "code": code_text, "reason": str(e)})
+            continue
+
+        if res.status_code != 200:
+            failed.append({"stock_id": stock_id, "code": code_text, "reason": f"HTTP {res.status_code}"})
+            continue
+
+        data = _extract_kabutan_yields(res.text)
+        if all(value is None for value in data.values()):
+            try:
+                stock_res = requests.get(
+                    stock_url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=20,
+                )
+            except Exception as e:
+                failed.append({"stock_id": stock_id, "code": code_text, "reason": f"Fallback error: {e}"})
+                continue
+
+            if stock_res.status_code != 200:
+                failed.append({"stock_id": stock_id, "code": code_text, "reason": f"Fallback HTTP {stock_res.status_code}"})
+                continue
+
+            dividend = _extract_kabutan_dividend_from_stock(stock_res.text)
+            if dividend is None:
+                failed.append({"stock_id": stock_id, "code": code_text, "reason": "Parse failed"})
+                continue
+            data = {
+                "yield_total": dividend,
+                "yield_benefit": 0.0,
+                "yield_dividend": dividend,
+            }
+
+        con.execute(
+            """
+            INSERT OR REPLACE INTO kabutan_yields
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                stock_id,
+                data.get("yield_total"),
+                data.get("yield_benefit"),
+                data.get("yield_dividend"),
+                today,
+                yutai_url,
+                datetime.now(),
+            ],
+        )
+        updated += 1
+
+    con.commit()
+    con.close()
+
+    return {
+        "message": "Kabutan yields updated",
+        "total_stocks": len(stock_rows),
+        "updated_stocks": updated,
+        "skipped_stocks": skipped,
+        "failed": failed,
     }
 
 

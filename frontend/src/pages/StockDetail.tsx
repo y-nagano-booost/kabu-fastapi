@@ -413,6 +413,16 @@ export default function StockDetail() {
   const financialLink = currentStock
     ? `https://www.buffett-code.com/company/${currentStock.code}/financial`
     : null
+  const yahooSymbol = currentStock
+    ? (currentStock.code.endsWith(".T") ? currentStock.code : `${currentStock.code}.T`)
+    : null
+  const yahooLink = yahooSymbol
+    ? `https://finance.yahoo.co.jp/quote/${yahooSymbol}`
+    : null
+  const minkabuCode = currentStock ? currentStock.code.replace(/\.T$/, "") : null
+  const minkabuLink = minkabuCode
+    ? `https://minkabu.jp/stock/${minkabuCode}/analysis`
+    : null
 
   return (
 <div className="stock-detail-container">
@@ -593,11 +603,23 @@ export default function StockDetail() {
       </>
     )}
   </div>
-  {financialLink && (
+  {(financialLink || yahooLink || minkabuLink) && (
     <div className="external-link-section">
-      <a href={financialLink} target="_blank" rel="noreferrer">
-        バフェット・コード 財務情報を見る（{currentStock?.code}）
-      </a>
+      {financialLink && (
+        <a className="detail-link" href={financialLink} target="_blank" rel="noreferrer">
+          バフェット・コード 財務情報を見る（{currentStock?.code}）
+        </a>
+      )}
+      {yahooLink && (
+        <a className="detail-link" href={yahooLink} target="_blank" rel="noreferrer">
+          Yahoo!ファイナンス
+        </a>
+      )}
+      {minkabuLink && (
+        <a className="detail-link" href={minkabuLink} target="_blank" rel="noreferrer">
+          みんかぶ 株価予想
+        </a>
+      )}
     </div>
   )}
 </div>

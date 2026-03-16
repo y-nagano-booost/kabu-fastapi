@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react"
 import "../App.css"
-import StockForm from "../components/StockForm"
 import StockTable from "../components/StockTable"
 
 type Stock = {
@@ -23,12 +22,29 @@ type Stock = {
   rsi14?: number | null
   rsi30?: number | null
   rsi60?: number | null
+  minkabu_target_price?: number | null
+  minkabu_target_rating?: string | null
+  minkabu_theoretical_price?: number | null
+  minkabu_individual_price?: number | null
+  minkabu_individual_rating?: string | null
+  minkabu_analyst_price?: number | null
+  minkabu_analyst_rating?: string | null
+  minkabu_fetched_date?: string | null
+  kabutan_total_yield?: number | null
+  kabutan_benefit_yield?: number | null
+  kabutan_dividend_yield?: number | null
+  kabutan_fetched_date?: string | null
 }
 
 function App() {
   const [stocks, setStocks] = useState<Stock[]>([])
   const [isUpdatingAllDaily, setIsUpdatingAllDaily] = useState(false)
   const [updateAllMessage, setUpdateAllMessage] = useState("")
+  const [isUpdatingMinkabu, setIsUpdatingMinkabu] = useState(false)
+  const [updateMinkabuMessage, setUpdateMinkabuMessage] = useState("")
+  const [isUpdatingKabutan, setIsUpdatingKabutan] = useState(false)
+  const [updateKabutanMessage, setUpdateKabutanMessage] = useState("")
+  const [isActionsVisible, setIsActionsVisible] = useState(true)
 
   // -----------------------------
   // 一覧取得
@@ -147,6 +163,54 @@ function App() {
     }
   }
 
+  const updateAllMinkabu = async () => {
+    if (isUpdatingMinkabu) return
+    setIsUpdatingMinkabu(true)
+    setUpdateMinkabuMessage("みんかぶ予想を取得中...")
+    try {
+      const res = await fetch("http://localhost:8000/api/stocks/update-minkabu-forecast-all", {
+        method: "POST",
+      })
+      if (!res.ok) {
+        setUpdateMinkabuMessage("取得に失敗しました")
+        return
+      }
+      const data = await res.json()
+      setUpdateMinkabuMessage(
+        `更新: ${data.updated_stocks} / スキップ: ${data.skipped_stocks} / 失敗: ${data.failed?.length ?? 0}`
+      )
+      fetchStocks()
+    } catch {
+      setUpdateMinkabuMessage("取得に失敗しました")
+    } finally {
+      setIsUpdatingMinkabu(false)
+    }
+  }
+
+  const updateAllKabutan = async () => {
+    if (isUpdatingKabutan) return
+    setIsUpdatingKabutan(true)
+    setUpdateKabutanMessage("配当・優待利回りを取得中...")
+    try {
+      const res = await fetch("http://localhost:8000/api/stocks/update-kabutan-yields-all", {
+        method: "POST",
+      })
+      if (!res.ok) {
+        setUpdateKabutanMessage("取得に失敗しました")
+        return
+      }
+      const data = await res.json()
+      setUpdateKabutanMessage(
+        `更新: ${data.updated_stocks} / スキップ: ${data.skipped_stocks} / 失敗: ${data.failed?.length ?? 0}`
+      )
+      fetchStocks()
+    } catch {
+      setUpdateKabutanMessage("取得に失敗しました")
+    } finally {
+      setIsUpdatingKabutan(false)
+    }
+  }
+
   const exportStocksCsv = () => {
     const headers = [
       "id",
@@ -167,6 +231,18 @@ function App() {
       "rsi14",
       "rsi30",
       "rsi60",
+      "minkabu_target_price",
+      "minkabu_target_rating",
+      "minkabu_theoretical_price",
+      "minkabu_individual_price",
+      "minkabu_individual_rating",
+      "minkabu_analyst_price",
+      "minkabu_analyst_rating",
+      "minkabu_fetched_date",
+      "kabutan_total_yield",
+      "kabutan_benefit_yield",
+      "kabutan_dividend_yield",
+      "kabutan_fetched_date",
     ]
 
     const escapeCsv = (value: unknown) => {
@@ -197,6 +273,18 @@ function App() {
       s.rsi14 ?? "",
       s.rsi30 ?? "",
       s.rsi60 ?? "",
+      s.minkabu_target_price ?? "",
+      s.minkabu_target_rating ?? "",
+      s.minkabu_theoretical_price ?? "",
+      s.minkabu_individual_price ?? "",
+      s.minkabu_individual_rating ?? "",
+      s.minkabu_analyst_price ?? "",
+      s.minkabu_analyst_rating ?? "",
+      s.minkabu_fetched_date ?? "",
+      s.kabutan_total_yield ?? "",
+      s.kabutan_benefit_yield ?? "",
+      s.kabutan_dividend_yield ?? "",
+      s.kabutan_fetched_date ?? "",
     ])
 
     const csv = [headers, ...rows]
@@ -218,24 +306,55 @@ function App() {
   return (
     <div className="container">
       <h1 className="title">📈 株式銘柄管理</h1>
-      <div className="home-actions">
-        <button
-          className="save"
-          onClick={updateAllDaily}
-          disabled={isUpdatingAllDaily}
-        >
-          {isUpdatingAllDaily ? "更新中..." : "全銘柄7日分DB更新"}
-        </button>
-        <button onClick={exportStocksCsv}>CSVエクスポート</button>
-        {updateAllMessage && <span className="update-message">{updateAllMessage}</span>}
-      </div>
+      <section className="panel">
+        <div className="panel-header">
+          <h3 className="panel-title">{"\u30c7\u30fc\u30bf\u53d6\u5f97"}</h3>
+          <button
+            type="button"
+            className="panel-toggle"
+            onClick={() => setIsActionsVisible((prev) => !prev)}
+          >
+            {isActionsVisible ? "\u975e\u8868\u793a" : "\u8868\u793a"}
+          </button>
+        </div>
+        {isActionsVisible && (
+          <div className="home-actions">
+            <button
+              className="save"
+              onClick={updateAllDaily}
+              disabled={isUpdatingAllDaily}
+            >
+              {isUpdatingAllDaily ? "\u66f4\u65b0\u4e2d..." : "\u5168\u92d8\u67c4\u0037\u65e5\u5206\u0044\u0042\u66f4\u65b0"}
+            </button>
+            <button
+              className="save"
+              onClick={updateAllMinkabu}
+              disabled={isUpdatingMinkabu}
+            >
+              {isUpdatingMinkabu ? "\u53d6\u5f97\u4e2d..." : "\u307f\u3093\u304b\u3076\u4e88\u60f3 \u4e00\u62ec\u53d6\u5f97"}
+            </button>
+            <button
+              className="save"
+              onClick={updateAllKabutan}
+              disabled={isUpdatingKabutan}
+            >
+              {isUpdatingKabutan ? "\u53d6\u5f97\u4e2d..." : "\u914d\u5f53\u30fb\u512a\u5f85\u5229\u56de\u308a \u4e00\u62ec\u53d6\u5f97"}
+            </button>
+            <button onClick={exportStocksCsv}>{"\u0043\u0053\u0056\u30a8\u30af\u30b9\u30dd\u30fc\u30c8"}</button>
+          </div>
+        )}
+        <div className="panel-messages">
+          {updateAllMessage && <span className="update-message">{updateAllMessage}</span>}
+          {updateMinkabuMessage && <span className="update-message">{updateMinkabuMessage}</span>}
+          {updateKabutanMessage && <span className="update-message">{updateKabutanMessage}</span>}
+        </div>
+      </section>
 
-      {/* 新規追加専用 */}
-      <StockForm onAdd={addStock} />
 
       {/* 一覧編集専用 */}
       <StockTable
         stocks={stocks}
+        onAdd={addStock}
         onUpdate={updateStock}
         onDelete={deleteStock}
         onAddTrade={addTrade}

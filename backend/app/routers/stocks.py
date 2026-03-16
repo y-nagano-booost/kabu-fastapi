@@ -104,6 +104,14 @@ def update_daily_all(days: int = 7, batch_size: int = 50):
 
     return update_all_daily_data(days=days, batch_size=batch_size)
 
+@router.post("/update-minkabu-forecast-all")
+def update_minkabu_forecast_all():
+    return update_minkabu_forecasts_all()
+
+@router.post("/update-kabutan-yields-all")
+def update_kabutan_yields_all_endpoint():
+    return update_kabutan_yields_all()
+
 @router.post("/{stock_id}/update-earnings")
 def update_earnings(stock_id: int):
 

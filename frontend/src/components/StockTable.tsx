@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom"
-import { Fragment, useMemo, useState } from "react"
+import { Fragment, type MouseEvent, useMemo, useState } from "react"
 import StockForm from "./StockForm"
 
 type Stock = {
@@ -77,6 +77,7 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
   const [isFiltersVisible, setIsFiltersVisible] = useState(true)
   const [tradeFormOpenId, setTradeFormOpenId] = useState<number | null>(null)
   const [isCompactView, setIsCompactView] = useState(false)
+  const [rowDetailMode, setRowDetailMode] = useState<Record<number, boolean>>({})
   const [tradeDate, setTradeDate] = useState("")
   const [tradeSide, setTradeSide] = useState<"buy" | "sell">("buy")
   const [tradeQuantity, setTradeQuantity] = useState("")
@@ -276,7 +277,7 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
 
   const getTheorySignal = (theory?: number | null, current?: number | null) => {
     if (theory == null || current == null) return null
-    return theory > current ? "sell" : "buy"
+    return current > theory ? "sell" : "buy"
   }
 
   const getChangeClass = (value?: number | null) => {
@@ -337,6 +338,81 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
     const trades = await onFetchTrades(stockId)
     setTradeMap((prev) => ({ ...prev, [stockId]: trades }))
   }
+
+  const setRowDetail = (stockId: number, isDetail: boolean) => {
+    setRowDetailMode((prev) => ({
+      ...prev,
+      [stockId]: isDetail,
+    }))
+  }
+
+  const getIsDetailRow = (stockId: number) => rowDetailMode[stockId] ?? !isCompactView
+
+  const handleRowDoubleClick = (
+    event: MouseEvent<HTMLTableRowElement>,
+    stockId: number,
+    isDetailRow: boolean
+  ) => {
+    if (isDetailRow) return
+
+    const target = event.target
+    if (target instanceof HTMLElement && target.closest("a, button, input, select, textarea, label")) {
+      return
+    }
+
+    setRowDetail(stockId, true)
+  }
+
+  const handleCompactFavoriteChange = (stock: Stock, checked: boolean) => {
+    onUpdate({
+      ...stock,
+      ...editedRows[stock.id],
+      favorite: checked,
+    })
+
+    setEditedRows((prev) => {
+      const copy = { ...prev }
+      delete copy[stock.id]
+      return copy
+    })
+  }
+
+  const tableColumnCount = 10
+
+  const renderActionStack = (stockId: number, isEdited: boolean, isDetailRow: boolean) => (
+    <div className="action-stack">
+      <button
+        type="button"
+        className="row-mode-toggle"
+        onClick={() => setRowDetail(stockId, !isDetailRow)}
+      >
+        {isDetailRow ? "簡易表示" : "詳細表示"}
+      </button>
+      <Link className="detail-link" to={`/stocks/${stockId}`}>
+        銘柄詳細
+      </Link>
+      <button
+        type="button"
+        onClick={() => handleSave(stockId)}
+        disabled={!isEdited}
+        aria-label="保存"
+        title="保存"
+      >
+        💾
+      </button>
+      <button type="button" onClick={() => onDelete(stockId)} aria-label="削除" title="削除">
+        🗑
+      </button>
+      <button
+        type="button"
+        onClick={() => void openTradeForm(stockId)}
+        aria-label="取引履歴"
+        title="取引履歴"
+      >
+        📒
+      </button>
+    </div>
+  )
 
   return (
     <div className="card">
@@ -470,26 +546,11 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
         className="filter-toggle"
         onClick={() => setIsCompactView((prev) => !prev)}
       >
-        {isCompactView ? "詳細モード" : "簡易モード"}
+        {isCompactView ? "全件を詳細表示" : "全件を簡易表示"}
       </button>
 <div className="table-wrapper">
-       <table className={`table table-sticky${isCompactView ? " compact-view" : ""}`}>
+       <table className="table table-sticky">
         <thead>
-          
-          {isCompactView ? (
-          <tr className="sub-header">
-            <th className="sticky-col sticky-1" onClick={() => handleSort("name")}>{"銘柄名"}</th>
-            <th onClick={() => handleSort("latest_close")}>{"最新株価"}</th>
-            <th onClick={() => handleSort("holding_value")}>{"保有価値"}</th>
-            <th onClick={() => handleSort("unrealized_pnl")}>{"含み損益"}</th>
-            <th onClick={() => handleSort("change_percent")}>{"前日比率"}</th>
-            <th onClick={() => handleSort("rsi14")}>RSI14</th>
-            <th onClick={() => handleSort("minkabu_target_rating")}>{"目標評価"}</th>
-            <th onClick={() => handleSort("minkabu_target_price")}>{"目標株価"}</th>
-            <th onClick={() => handleSort("kabutan_total_yield")}>{"配当＋優待"}</th>
-            <th className="sticky-col-right">{"詳細"}</th>
-          </tr>
-        ) : (
           <tr className="sub-header">
             <th className="sticky-col sticky-1" onClick={() => handleSort("favorite")}>{"\u2605"}</th>
             <th className="sticky-col sticky-2">
@@ -550,32 +611,66 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
             </th>
             <th className="sticky-col-right">{"操作"}</th>
           </tr>
-        )}
         </thead>
 
         <tbody>
           {sortedFilteredStocks.map((stock) => {
             const row = editedRows[stock.id] || stock
             const isEdited = !!editedRows[stock.id]
+            const isDetailRow = getIsDetailRow(stock.id)
+            const isCompactRow = !isDetailRow
 
             return (
               <Fragment key={stock.id}>
-                <tr style={{ background: isEdited ? "#fff8dc" : "" }}>
-                  {isCompactView ? (
+                <tr
+                  className={isDetailRow ? "table-row-detail" : "table-row-compact"}
+                  style={{ background: isEdited ? "#fff8dc" : "" }}
+                  onDoubleClick={(event) => handleRowDoubleClick(event, stock.id, isDetailRow)}
+                  title={isCompactRow ? "ダブルクリックで詳細表示" : undefined}
+                >
+                  {isCompactRow ? (
                     <>
-<td className="sticky-col sticky-1">{row.name}</td>
-                      <td><span className="highlight-value">{fmtNumber(stock.latest_close)}</span></td>
-                      <td><span className="highlight-value">{fmtNumber(stock.holding_value)}</span></td>
-                      <td className={getChangeClass(stock.unrealized_pnl)}>{fmtNumber(stock.unrealized_pnl)}</td>
-                      <td className={getChangeClass(stock.change_percent)}>{stock.change_percent == null ? "-" : `${fmtFixed(stock.change_percent)}%`}</td>
-                      <td className={getRsiClass(stock.rsi14)}>{fmtFixed(stock.rsi14)}</td>
-                      <td className={getRatingClass(stock.minkabu_target_rating)}>{stock.minkabu_target_rating ?? "-"}</td>
-                      <td>{fmtNumber(stock.minkabu_target_price, 0)}</td>
-                      <td>{fmtPercent(stock.kabutan_total_yield, 2)}</td>
-                      <td className="sticky-col-right">
-                        <Link className="detail-link" to={`/stocks/${stock.id}`}>
-                          {"詳細"}
-                        </Link>
+                      <td className="sticky-col sticky-1">
+                        <input
+                          type="checkbox"
+                          checked={row.favorite || false}
+                          onChange={(e) => handleCompactFavoriteChange(stock, e.target.checked)}
+                        />
+                      </td>
+                      <td className="sticky-col sticky-2 compact-name-cell">
+                        {row.name}
+                      </td>
+                      <td className="compact-value-cell">
+                        <span className="highlight-value">{fmtNumber(stock.latest_close)}</span>
+                      </td>
+                      <td className="compact-value-cell">
+                        <span className="highlight-value">{fmtNumber(stock.holding_value)}</span>
+                      </td>
+                      <td className={`compact-value-cell ${getChangeClass(stock.unrealized_pnl)}`}>
+                        {fmtNumber(stock.unrealized_pnl)}
+                      </td>
+                      <td className={`compact-value-cell ${getChangeClass(stock.change_percent)}`}>
+                        {stock.change_percent == null ? "-" : `${fmtFixed(stock.change_percent)}%`}
+                      </td>
+                      <td className={`compact-value-cell ${getRsiClass(stock.rsi14)}`}>
+                        {fmtFixed(stock.rsi14)}
+                      </td>
+                      <td className="compact-rating-cell">
+                        <span className={`cell-badge ${getRatingClass(stock.minkabu_target_rating)}`}>
+                          {stock.minkabu_target_rating ?? "-"}
+                        </span>
+                      </td>
+                      <td className="compact-value-cell">
+                        {fmtPercent(stock.kabutan_total_yield, 2)}
+                      </td>
+                      <td className="sticky-col-right compact-mode-cell">
+                        <button
+                          type="button"
+                          className="row-mode-toggle"
+                          onClick={() => setRowDetail(stock.id, true)}
+                        >
+                          詳細表示
+                        </button>
                       </td>
                     </>
                   ) : (
@@ -725,25 +820,7 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                   </td>
 
                   <td className="sticky-col-right">
-                    <div className="action-stack">
-                      <Link className="detail-link" to={`/stocks/${stock.id}`}>
-                        {"\u8a73\u7d30"}
-                      </Link>
-                      <button
-                        onClick={() => handleSave(stock.id)}
-                        disabled={!isEdited}
-                        aria-label="保存"
-                        title="保存"
-                      >
-                        💾
-                      </button>
-                      <button onClick={() => onDelete(stock.id)} aria-label="削除" title="削除">
-                        🗑
-                      </button>
-                      <button onClick={() => void openTradeForm(stock.id)} aria-label="取引履歴" title="取引履歴">
-                        📒
-                      </button>
-                    </div>
+                    {renderActionStack(stock.id, isEdited, isDetailRow)}
                   </td>
                     </>
                   )}
@@ -751,7 +828,7 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
 
                 {tradeFormOpenId === stock.id && (
                   <tr key={`trade-form-${stock.id}`} className="trade-form-row">
-                    <td colSpan={10}>
+                    <td colSpan={tableColumnCount}>
                       <div className="trade-form">
                         <input
                           type="date"

@@ -281,16 +281,27 @@ def delete_stock(stock_id: int):
     con.close()
 
 
-def update_stock(
-    stock_id: int,
-    code: str,
-    name: str,
-    industry: Optional[str],
-    favorite: bool,
-    buy_price: Optional[float],
-    sell_price: Optional[float],
-):
+def update_stock(stock_id: int, updates: dict):
     con = get_connection()
+    current = con.execute(
+        """
+        SELECT code, name, industry, favorite, buy_price, sell_price
+        FROM stocks
+        WHERE id = ?
+        """,
+        [stock_id],
+    ).fetchone()
+    if current is None:
+        con.close()
+        raise ValueError("Stock not found")
+
+    code = updates["code"] if updates.get("code") is not None else current[0]
+    name = updates["name"] if updates.get("name") is not None else current[1]
+    industry = updates["industry"] if "industry" in updates else current[2]
+    favorite = updates["favorite"] if updates.get("favorite") is not None else current[3]
+    buy_price = updates["buy_price"] if "buy_price" in updates else current[4]
+    sell_price = updates["sell_price"] if "sell_price" in updates else current[5]
+
     con.execute(
         """
         UPDATE stocks

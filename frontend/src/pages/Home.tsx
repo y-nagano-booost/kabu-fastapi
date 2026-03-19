@@ -36,6 +36,62 @@ type Stock = {
   kabutan_fetched_date?: string | null
 }
 
+type FavoriteBackup = {
+  ids: number[]
+  savedAt: string
+}
+
+const FAVORITE_BACKUP_KEY = "kabu.favorite-backup.v1"
+
+const getFavoriteIds = (items: Stock[]) =>
+  [...new Set(items.filter((stock) => stock.favorite).map((stock) => stock.id))].sort((a, b) => a - b)
+
+const readFavoriteBackup = (): FavoriteBackup | null => {
+  if (typeof window === "undefined") return null
+
+  const raw = window.localStorage.getItem(FAVORITE_BACKUP_KEY)
+  if (!raw) return null
+
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== "object" || !("ids" in parsed)) return null
+
+    const idsValue = (parsed as { ids?: unknown }).ids
+    const savedAtValue = (parsed as { savedAt?: unknown }).savedAt
+    if (!Array.isArray(idsValue)) return null
+
+    const ids = [...new Set(
+      idsValue
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )].sort((a, b) => a - b)
+
+    return {
+      ids,
+      savedAt: typeof savedAtValue === "string" ? savedAtValue : "",
+    }
+  } catch {
+    return null
+  }
+}
+
+const writeFavoriteBackup = (ids: number[]) => {
+  if (typeof window === "undefined") return
+
+  const payload: FavoriteBackup = {
+    ids: [...new Set(ids)].sort((a, b) => a - b),
+    savedAt: new Date().toISOString(),
+  }
+  window.localStorage.setItem(FAVORITE_BACKUP_KEY, JSON.stringify(payload))
+}
+
+const formatFavoriteBackupSavedAt = (savedAt: string) => {
+  if (!savedAt) return ""
+  const date = new Date(savedAt)
+  if (Number.isNaN(date.getTime())) return ""
+  return date.toLocaleString()
+}
+
 function App() {
   const [stocks, setStocks] = useState<Stock[]>([])
   const [isUpdatingAllDaily, setIsUpdatingAllDaily] = useState(false)
@@ -45,19 +101,69 @@ function App() {
   const [isUpdatingKabutan, setIsUpdatingKabutan] = useState(false)
   const [updateKabutanMessage, setUpdateKabutanMessage] = useState("")
   const [isActionsVisible, setIsActionsVisible] = useState(true)
+  const [favoriteRestoreInfo, setFavoriteRestoreInfo] = useState<FavoriteBackup | null>(null)
+  const [favoriteRestoreMessage, setFavoriteRestoreMessage] = useState("")
+  const [isRestoringFavorites, setIsRestoringFavorites] = useState(false)
 
   // -----------------------------
   // 一覧取得
   // -----------------------------
-  const fetchStocks = async () => {
+  const syncFavoriteBackup = (nextStocks: Stock[], allowEmptyFavoriteBackup = false) => {
+    const favoriteIds = getFavoriteIds(nextStocks)
+    if (favoriteIds.length > 0 || allowEmptyFavoriteBackup) {
+      writeFavoriteBackup(favoriteIds)
+      setFavoriteRestoreInfo(null)
+      return
+    }
+
+    const backup = readFavoriteBackup()
+    if (backup && backup.ids.length > 0) {
+      setFavoriteRestoreInfo(backup)
+      return
+    }
+
+    setFavoriteRestoreInfo(null)
+  }
+
+  const fetchStocks = async (options?: { allowEmptyFavoriteBackup?: boolean }) => {
     const res = await fetch("http://localhost:8000/api/stocks", { cache: "no-store" })
     const data: Stock[] = await res.json()
     setStocks(data)
+    syncFavoriteBackup(data, options?.allowEmptyFavoriteBackup ?? false)
   }
 
   useEffect(() => {
-    fetchStocks()
+    void fetchStocks()
   }, [])
+
+  const saveStock = async (
+    stock: Stock,
+    options: { reload?: boolean; allowEmptyFavoriteBackup?: boolean } = {}
+  ) => {
+    const payload: Record<string, unknown> = {
+      code: stock.code,
+      name: stock.name,
+      industry: stock.industry ?? null,
+      buy_price: stock.buy_price ?? null,
+      sell_price: stock.sell_price ?? null,
+    }
+    if (stock.favorite !== undefined) {
+      payload.favorite = stock.favorite
+    }
+
+    const res = await fetch(`http://localhost:8000/api/stocks/${stock.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) {
+      throw new Error("failed to update stock")
+    }
+
+    if (options.reload !== false) {
+      await fetchStocks({ allowEmptyFavoriteBackup: options.allowEmptyFavoriteBackup ?? true })
+    }
+  }
 
   // -----------------------------
   // 新規追加
@@ -74,27 +180,14 @@ function App() {
       body: JSON.stringify({ code, name, industry, favorite })
     })
 
-    fetchStocks()
+    await fetchStocks({ allowEmptyFavoriteBackup: true })
   }
 
   // -----------------------------
   // 更新（保存ボタン用）
   // -----------------------------
   const updateStock = async (stock: Stock) => {
-    await fetch(`http://localhost:8000/api/stocks/${stock.id}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        code: stock.code,
-        name: stock.name,
-        industry: stock.industry,
-        favorite: stock.favorite,
-        buy_price: stock.buy_price,
-        sell_price: stock.sell_price,
-      }),
-    })
-
-    fetchStocks()
+    await saveStock(stock, { allowEmptyFavoriteBackup: true })
   }
 
   // -----------------------------
@@ -105,7 +198,7 @@ function App() {
       method: "DELETE"
     })
 
-    fetchStocks()
+    await fetchStocks({ allowEmptyFavoriteBackup: true })
   }
 
   const addTrade = async (
@@ -139,6 +232,37 @@ function App() {
       { method: "DELETE" }
     )
     await fetchStocks()
+  }
+
+  const restoreFavoriteBackup = async () => {
+    const backup = readFavoriteBackup()
+    if (!backup || backup.ids.length === 0 || isRestoringFavorites) return
+
+    const favoriteIdSet = new Set(backup.ids)
+    const restoreTargets = stocks.filter((stock) => favoriteIdSet.has(stock.id) && !stock.favorite)
+
+    if (restoreTargets.length === 0) {
+      writeFavoriteBackup(getFavoriteIds(stocks))
+      setFavoriteRestoreInfo(null)
+      setFavoriteRestoreMessage("復元できるお気に入りはありません")
+      return
+    }
+
+    setIsRestoringFavorites(true)
+    setFavoriteRestoreMessage(`お気に入りを ${restoreTargets.length} 件復元中...`)
+
+    try {
+      for (const stock of restoreTargets) {
+        await saveStock({ ...stock, favorite: true }, { reload: false })
+      }
+      await fetchStocks({ allowEmptyFavoriteBackup: true })
+      setFavoriteRestoreMessage(`お気に入りを ${restoreTargets.length} 件復元しました`)
+    } catch {
+      setFavoriteRestoreMessage("お気に入りの復元に失敗しました")
+      await fetchStocks()
+    } finally {
+      setIsRestoringFavorites(false)
+    }
   }
 
   const updateAllDaily = async () => {
@@ -347,9 +471,31 @@ function App() {
           {updateAllMessage && <span className="update-message">{updateAllMessage}</span>}
           {updateMinkabuMessage && <span className="update-message">{updateMinkabuMessage}</span>}
           {updateKabutanMessage && <span className="update-message">{updateKabutanMessage}</span>}
+          {favoriteRestoreMessage && <span className="update-message">{favoriteRestoreMessage}</span>}
         </div>
       </section>
 
+      {favoriteRestoreInfo && (
+        <section className="favorite-recovery">
+          <div className="favorite-recovery-copy">
+            <strong>お気に入りが全件 OFF になっています</strong>
+            <span>
+              このブラウザに残っている {favoriteRestoreInfo.ids.length} 件のバックアップから復元できます。
+            </span>
+            {formatFavoriteBackupSavedAt(favoriteRestoreInfo.savedAt) && (
+              <small>最終バックアップ: {formatFavoriteBackupSavedAt(favoriteRestoreInfo.savedAt)}</small>
+            )}
+          </div>
+          <button
+            type="button"
+            className="save"
+            onClick={restoreFavoriteBackup}
+            disabled={isRestoringFavorites}
+          >
+            {isRestoringFavorites ? "復元中..." : "お気に入りを復元"}
+          </button>
+        </section>
+      )}
 
       {/* 一覧編集専用 */}
       <StockTable

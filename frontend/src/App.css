@@ -41,6 +41,33 @@ body {
   margin-bottom: 14px;
 }
 
+.favorite-recovery {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid #f6c978;
+  border-radius: 10px;
+  background: #fff7e8;
+}
+
+.favorite-recovery-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.favorite-recovery strong {
+  color: #9a3412;
+}
+
+.favorite-recovery span,
+.favorite-recovery small {
+  color: #7c2d12;
+}
+
 .card {
   background: #ffffff;
   border: 1px solid #e5e7eb;
@@ -138,12 +165,6 @@ body {
   min-width: 44px;
   width: 44px;
   text-align: center;
-}
-
-.table-sticky.compact-view .sticky-1 {
-  min-width: 180px;
-  width: 180px;
-  text-align: left;
 }
 
 .table-sticky .sticky-2 {
@@ -385,6 +406,17 @@ button.delete {
   color: #4b5563;
 }
 
+@media (max-width: 960px) {
+  .favorite-recovery {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .favorite-recovery button {
+    width: 100%;
+  }
+}
+
 .date-range {
   display: flex;
   gap: 16px;
@@ -541,6 +573,37 @@ button.delete {
   border: 1px solid #cbd5f5;
 }
 
+.row-mode-toggle {
+  background: #e2e8f0;
+  color: #0f172a;
+  border: 1px solid #cbd5e1;
+}
+
+.table-row-compact {
+  cursor: zoom-in;
+}
+
+.table-row-compact .highlight-value {
+  font-size: 16px;
+}
+
+.compact-name-cell {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.compact-value-cell {
+  white-space: nowrap;
+}
+
+.compact-rating-cell {
+  white-space: nowrap;
+}
+
+.compact-mode-cell {
+  min-width: 120px;
+}
+
 .filter-advanced {
   display: flex;
   flex-direction: column;
@@ -623,6 +686,30 @@ button.delete {
   font-size: 11px;
   color: #94a3b8;
   background: #f8fafc;
+}
+
+.cell-code-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: #6b7280;
+}
+
+.cell-name-text {
+  font-size: 15px;
+  font-weight: 600;
+  color: #111827;
+}
+
+.cell-inline-note {
+  font-size: 11px;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.cell-badge-muted {
+  border-color: #e2e8f0;
+  background: #f8fafc;
+  color: #64748b;
 }
 
 .header-stack {

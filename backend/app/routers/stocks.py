@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from app.models import Stock, TradeHistoryCreate
+from app.models import StockCreate, StockUpdate, TradeHistoryCreate
 from app.services.stock_service import (
     get_all_stocks,
     create_stock,
@@ -11,13 +11,19 @@ from app.services.stock_service import *
 router = APIRouter(prefix="/api/stocks", tags=["stocks"])
 
 
+def _model_dump_exclude_unset(model):
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_unset=True)
+    return model.dict(exclude_unset=True)
+
+
 @router.get("")
 def get_stocks():
     return get_all_stocks()
 
 
 @router.post("")
-def add_stock(stock: Stock):
+def add_stock(stock: StockCreate):
     create_stock(
         stock.code,
         stock.name,
@@ -30,16 +36,11 @@ def add_stock(stock: Stock):
 
 
 @router.put("/{stock_id}")
-def edit_stock(stock_id: int, stock: Stock):
-    update_stock(
-        stock_id,
-        stock.code,
-        stock.name,
-        stock.industry,
-        stock.favorite,
-        stock.buy_price,
-        stock.sell_price,
-    )
+def edit_stock(stock_id: int, stock: StockUpdate):
+    try:
+        update_stock(stock_id, _model_dump_exclude_unset(stock))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     return {"message": "updated"}
 
 

@@ -1,4 +1,7 @@
 .vscode/
 .git/
 venv/
+__pycache__/
+*.pyc
 
+backend/stock.duckdb.wal

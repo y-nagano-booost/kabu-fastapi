@@ -1,11 +1,25 @@
 from app.database import get_connection
 from typing import Optional
+import logging
 import re
+import time
 import requests
 from bs4 import BeautifulSoup
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
+
+
+logger = logging.getLogger(__name__)
+
+TOPIX_TICKER = "^TOPX"
+YFINANCE_MAX_RETRIES = 3
+YFINANCE_RETRY_DELAY_SECONDS = 1
+BETA_LOOKBACK_DAYS = 365 * 2
+BETA_FETCH_BUFFER_DAYS = 30
+BETA_HISTORY_START_TOLERANCE_DAYS = 30
+BETA_HISTORY_END_TOLERANCE_DAYS = 14
+BETA_MIN_WEEKLY_POINTS = 52
 
 
 def _candidate_ticker_symbols(code: str):
@@ -78,6 +92,7 @@ def get_all_stocks():
     con = get_connection()
     _ensure_minkabu_table(con)
     _ensure_kabutan_table(con)
+    _ensure_stock_metrics_table(con)
     rows = con.execute("""
         WITH latest_daily AS (
             SELECT
@@ -128,6 +143,17 @@ def get_all_stocks():
                     ORDER BY fetched_date DESC, updated_at DESC
                 ) AS rn
             FROM kabutan_yields
+        ),
+        latest_metrics AS (
+            SELECT
+                company_id,
+                beta,
+                calc_date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY company_id
+                    ORDER BY calc_date DESC
+                ) AS rn
+            FROM stock_metrics
         )
         SELECT
             s.id,
@@ -158,7 +184,9 @@ def get_all_stocks():
             lk.yield_total,
             lk.yield_benefit,
             lk.yield_dividend,
-            lk.fetched_date
+            lk.fetched_date,
+            lmt.beta,
+            lmt.calc_date
         FROM stocks s
         LEFT JOIN latest_daily ld
             ON s.id = ld.stock_id
@@ -169,6 +197,9 @@ def get_all_stocks():
         LEFT JOIN latest_kabutan lk
             ON s.id = lk.stock_id
            AND lk.rn = 1
+        LEFT JOIN latest_metrics lmt
+            ON s.id = lmt.company_id
+           AND lmt.rn = 1
         ORDER BY favorite DESC, code
     """).fetchall()
     trade_rows = con.execute("""
@@ -243,6 +274,8 @@ def get_all_stocks():
             "kabutan_benefit_yield": r[23],
             "kabutan_dividend_yield": r[24],
             "kabutan_fetched_date": r[25],
+            "beta": r[26],
+            "beta_calc_date": r[27],
         }
         for r in rows
     ]
@@ -485,9 +518,462 @@ def _chunked(items, size: int):
         yield items[i:i + size]
 
 
+def _dedupe_tickers(tickers):
+    return list(dict.fromkeys([ticker for ticker in tickers if ticker]))
+
+
+def _download_history_batch(
+    tickers,
+    start,
+    end,
+    interval: str = "1d",
+    retries: int = YFINANCE_MAX_RETRIES,
+):
+    request_tickers = _dedupe_tickers(tickers)
+    if not request_tickers:
+        return pd.DataFrame(), "No tickers"
+
+    last_error = "No data"
+    for attempt in range(1, retries + 1):
+        try:
+            df = yf.download(
+                tickers=request_tickers,
+                start=start,
+                end=end,
+                interval=interval,
+                group_by="ticker",
+                auto_adjust=False,
+                progress=False,
+                threads=len(request_tickers) > 1,
+            )
+            if df is not None and not df.empty:
+                return df, None
+            last_error = "No data"
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning(
+                "yfinance download failed attempt=%s/%s tickers=%s reason=%s",
+                attempt,
+                retries,
+                ",".join(request_tickers),
+                last_error,
+            )
+        if attempt < retries:
+            time.sleep(YFINANCE_RETRY_DELAY_SECONDS)
+
+    return pd.DataFrame(), last_error
+
+
+def _normalize_history_frame(history_df):
+    if history_df is None or history_df.empty:
+        return None
+
+    normalized = history_df.copy()
+    if isinstance(normalized.columns, pd.MultiIndex):
+        normalized.columns = normalized.columns.get_level_values(0)
+
+    normalized = normalized.reset_index()
+    if "Date" not in normalized.columns and len(normalized.columns) > 0:
+        normalized.rename(columns={normalized.columns[0]: "Date"}, inplace=True)
+    if "Date" not in normalized.columns:
+        return None
+
+    normalized["Date"] = pd.to_datetime(normalized["Date"], utc=True).dt.tz_localize(None)
+    normalized = normalized.sort_values("Date")
+    return normalized
+
+
+def _extract_history_frame(downloaded_df, ticker_symbol: str):
+    if downloaded_df is None or downloaded_df.empty:
+        return None, "No data"
+
+    history_df = downloaded_df
+    if isinstance(downloaded_df.columns, pd.MultiIndex):
+        available = set(downloaded_df.columns.get_level_values(0))
+        if ticker_symbol not in available:
+            return None, "Missing ticker in response"
+        history_df = downloaded_df[ticker_symbol].copy()
+
+    normalized = _normalize_history_frame(history_df)
+    if normalized is None or normalized.empty:
+        return None, "No rows"
+    return normalized, None
+
+
+def _select_history_frame(downloaded_df, candidate_tickers):
+    reasons = []
+
+    for ticker_symbol in candidate_tickers:
+        history_df, reason = _extract_history_frame(downloaded_df, ticker_symbol)
+        if history_df is None:
+            reasons.append(f"{ticker_symbol}:{reason}")
+            continue
+        return history_df, ticker_symbol, None
+
+    if not reasons:
+        return None, None, "No data"
+    return None, None, "; ".join(reasons)
+
+
+def _is_data_shortage_reason(reason: Optional[str]):
+    if not reason:
+        return False
+
+    shortage_markers = (
+        "No data",
+        "No rows",
+        "Missing ticker in response",
+        "Missing Close column",
+        "No close data",
+        "Insufficient history",
+        "Insufficient weekly returns",
+        "Insufficient aligned weekly returns",
+    )
+    return any(marker in reason for marker in shortage_markers)
+
+
+def _prepare_daily_history_frame(history_df):
+    required_cols = {"Open", "High", "Low", "Close", "Volume"}
+    if history_df is None or history_df.empty:
+        return None, "No rows"
+    if not required_cols.issubset(history_df.columns):
+        return None, "Missing OHLCV columns"
+
+    daily_df = history_df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if daily_df.empty:
+        return None, "All rows are NaN"
+
+    daily_df["rsi14"] = calculate_rsi(daily_df, 14)
+    daily_df["rsi30"] = calculate_rsi(daily_df, 30)
+    daily_df["rsi60"] = calculate_rsi(daily_df, 60)
+    daily_df["Date"] = pd.to_datetime(daily_df["Date"]).dt.date
+    return daily_df, None
+
+
+def _insert_daily_rows(con, stock_id: int, history_df, target_start):
+    target_df = history_df[history_df["Date"] >= target_start]
+    if target_df.empty:
+        return 0
+
+    inserted = 0
+    for _, row in target_df.iterrows():
+        con.execute(
+            """
+            INSERT OR REPLACE INTO daily_prices
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                stock_id,
+                row["Date"],
+                float(row["Open"]),
+                float(row["High"]),
+                float(row["Low"]),
+                float(row["Close"]),
+                int(row["Volume"]) if not pd.isna(row["Volume"]) else None,
+                float(row["rsi14"]) if not pd.isna(row["rsi14"]) else None,
+                float(row["rsi30"]) if not pd.isna(row["rsi30"]) else None,
+                float(row["rsi60"]) if not pd.isna(row["rsi60"]) else None,
+            ],
+        )
+        inserted += 1
+
+    return inserted
+
+
+def _prepare_weekly_returns(history_df, required_start, required_end):
+    if history_df is None or history_df.empty:
+        return None, "No rows"
+    if "Close" not in history_df.columns:
+        return None, "Missing Close column"
+
+    close_series = (
+        history_df[["Date", "Close"]]
+        .dropna(subset=["Close"])
+        .set_index("Date")["Close"]
+        .sort_index()
+        .astype(float)
+    )
+    if close_series.empty:
+        return None, "No close data"
+
+    allowed_start = required_start + timedelta(days=BETA_HISTORY_START_TOLERANCE_DAYS)
+    allowed_end = required_end - timedelta(days=BETA_HISTORY_END_TOLERANCE_DAYS)
+
+    first_date = close_series.index.min().to_pydatetime()
+    last_date = close_series.index.max().to_pydatetime()
+    if first_date > allowed_start:
+        return None, f"Insufficient history start={first_date.date().isoformat()}"
+    if last_date < allowed_end:
+        return None, f"Insufficient history end={last_date.date().isoformat()}"
+
+    weekly_returns = close_series.resample("W").last().pct_change().dropna()
+    if len(weekly_returns) < BETA_MIN_WEEKLY_POINTS:
+        return None, f"Insufficient weekly returns ({len(weekly_returns)})"
+
+    return weekly_returns, None
+
+
+def _calculate_beta_from_returns(stock_returns, market_returns):
+    aligned = pd.concat(
+        [
+            stock_returns.rename("stock"),
+            market_returns.rename("market"),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+
+    if len(aligned) < BETA_MIN_WEEKLY_POINTS:
+        return None, f"Insufficient aligned weekly returns ({len(aligned)})"
+
+    market_variance = aligned["market"].var()
+    if pd.isna(market_variance) or market_variance == 0:
+        return None, "Market variance is zero"
+
+    beta = aligned["stock"].cov(aligned["market"]) / market_variance
+    if pd.isna(beta):
+        return None, "Beta calculation returned NaN"
+
+    return float(beta), None
+
+
+def _update_daily_prices_batch(con, stock_rows, days: int, batch_size: int):
+    today = datetime.today()
+    fetch_start = today - timedelta(days=days + 90)
+    fetch_end = today + timedelta(days=1)
+    target_start = (today - timedelta(days=days)).date()
+
+    updated_rows = 0
+    updated_stocks = 0
+    failed = []
+
+    for stock_batch in _chunked(stock_rows, batch_size):
+        batch_candidates = {
+            stock_id: _candidate_ticker_symbols(code)
+            for stock_id, code in stock_batch
+        }
+        batch_tickers = _dedupe_tickers(
+            ticker_symbol
+            for candidates in batch_candidates.values()
+            for ticker_symbol in candidates
+        )
+        batch_df, batch_error = _download_history_batch(
+            batch_tickers,
+            start=fetch_start,
+            end=fetch_end,
+            interval="1d",
+        )
+
+        for stock_id, code in stock_batch:
+            candidates = batch_candidates[stock_id]
+            history_df, used_ticker, reason = _select_history_frame(batch_df, candidates)
+            if history_df is None:
+                fallback_df, fallback_error = _download_history_batch(
+                    candidates,
+                    start=fetch_start,
+                    end=fetch_end,
+                    interval="1d",
+                )
+                history_df, used_ticker, reason = _select_history_frame(fallback_df, candidates)
+                if history_df is None:
+                    failed.append(
+                        {
+                            "stock_id": stock_id,
+                            "code": code,
+                            "ticker": ",".join(candidates),
+                            "reason": reason or fallback_error or batch_error or "No data",
+                        }
+                    )
+                    continue
+
+            daily_df, reason = _prepare_daily_history_frame(history_df)
+            if daily_df is None:
+                failed.append(
+                    {
+                        "stock_id": stock_id,
+                        "code": code,
+                        "ticker": used_ticker or ",".join(candidates),
+                        "reason": reason or "Invalid OHLCV data",
+                    }
+                )
+                continue
+
+            inserted = _insert_daily_rows(con, stock_id, daily_df, target_start)
+            if inserted > 0:
+                updated_stocks += 1
+                updated_rows += inserted
+
+    logger.info(
+        "daily price batch completed success=%s failed=%s",
+        updated_stocks,
+        len(failed),
+    )
+
+    return {
+        "updated_stocks": updated_stocks,
+        "updated_rows": updated_rows,
+        "failed": failed,
+    }
+
+
+def _upsert_stock_metric(con, company_id: int, beta: float, calc_date):
+    con.execute(
+        """
+        INSERT OR REPLACE INTO stock_metrics (company_id, beta, calc_date)
+        VALUES (?, ?, ?)
+        """,
+        [company_id, beta, calc_date],
+    )
+
+
+def _update_beta_batch(con, stock_rows, batch_size: int):
+    calc_date = datetime.today().date()
+    required_end = datetime.today()
+    required_start = required_end - timedelta(days=BETA_LOOKBACK_DAYS)
+    fetch_start = required_start - timedelta(days=BETA_FETCH_BUFFER_DAYS)
+    fetch_end = required_end + timedelta(days=1)
+
+    updated_stocks = 0
+    failed = []
+    skipped = []
+
+    for stock_batch in _chunked(stock_rows, batch_size):
+        batch_candidates = {
+            stock_id: _candidate_ticker_symbols(code)
+            for stock_id, code in stock_batch
+        }
+        batch_tickers = _dedupe_tickers(
+            [
+                ticker_symbol
+                for candidates in batch_candidates.values()
+                for ticker_symbol in candidates
+            ]
+            + [TOPIX_TICKER]
+        )
+        batch_df, batch_error = _download_history_batch(
+            batch_tickers,
+            start=fetch_start,
+            end=fetch_end,
+            interval="1d",
+        )
+
+        market_history_df, _, market_reason = _select_history_frame(batch_df, [TOPIX_TICKER])
+        if market_history_df is None:
+            market_fallback_df, fallback_error = _download_history_batch(
+                [TOPIX_TICKER],
+                start=fetch_start,
+                end=fetch_end,
+                interval="1d",
+            )
+            market_history_df, _, market_reason = _select_history_frame(
+                market_fallback_df,
+                [TOPIX_TICKER],
+            )
+            if market_history_df is None:
+                failed_reason = market_reason or fallback_error or batch_error or "Market download failed"
+                for stock_id, code in stock_batch:
+                    failed.append(
+                        {
+                            "company_id": stock_id,
+                            "code": code,
+                            "ticker": TOPIX_TICKER,
+                            "reason": failed_reason,
+                        }
+                    )
+                continue
+
+        market_returns, market_reason = _prepare_weekly_returns(
+            market_history_df,
+            required_start,
+            required_end,
+        )
+        if market_returns is None:
+            for stock_id, code in stock_batch:
+                failed.append(
+                    {
+                        "company_id": stock_id,
+                        "code": code,
+                        "ticker": TOPIX_TICKER,
+                        "reason": market_reason or "TOPIX weekly returns unavailable",
+                    }
+                )
+            continue
+
+        for stock_id, code in stock_batch:
+            candidates = batch_candidates[stock_id]
+            history_df, used_ticker, reason = _select_history_frame(batch_df, candidates)
+            if history_df is None:
+                fallback_df, fallback_error = _download_history_batch(
+                    candidates,
+                    start=fetch_start,
+                    end=fetch_end,
+                    interval="1d",
+                )
+                history_df, used_ticker, reason = _select_history_frame(fallback_df, candidates)
+                if history_df is None:
+                    result_row = {
+                        "company_id": stock_id,
+                        "code": code,
+                        "ticker": ",".join(candidates),
+                        "reason": reason or fallback_error or batch_error or "No data",
+                    }
+                    if _is_data_shortage_reason(result_row["reason"]):
+                        skipped.append(result_row)
+                    else:
+                        failed.append(result_row)
+                    continue
+
+            stock_returns, reason = _prepare_weekly_returns(
+                history_df,
+                required_start,
+                required_end,
+            )
+            if stock_returns is None:
+                skipped.append(
+                    {
+                        "company_id": stock_id,
+                        "code": code,
+                        "ticker": used_ticker or ",".join(candidates),
+                        "reason": reason or "Insufficient history",
+                    }
+                )
+                continue
+
+            beta, reason = _calculate_beta_from_returns(stock_returns, market_returns)
+            if beta is None:
+                skipped.append(
+                    {
+                        "company_id": stock_id,
+                        "code": code,
+                        "ticker": used_ticker or ",".join(candidates),
+                        "reason": reason or "Unable to calculate beta",
+                    }
+                )
+                continue
+
+            _upsert_stock_metric(con, stock_id, beta, calc_date)
+            updated_stocks += 1
+
+    logger.info(
+        "beta batch completed success=%s skipped=%s failed=%s failed_codes=%s",
+        updated_stocks,
+        len(skipped),
+        len(failed),
+        ",".join(item["code"] for item in failed),
+    )
+
+    return {
+        "updated_stocks": updated_stocks,
+        "failed": failed,
+        "skipped": skipped,
+        "calc_date": calc_date.isoformat(),
+    }
+
+
 def update_all_daily_data(days: int = 7, batch_size: int = 50):
 
     con = get_connection()
+    _ensure_stock_metrics_table(con)
     stock_rows = con.execute("""
         SELECT id, code
         FROM stocks
@@ -501,216 +987,43 @@ def update_all_daily_data(days: int = 7, batch_size: int = 50):
             "updated_stocks": 0,
             "updated_rows": 0,
             "failed": [],
+            "beta_updated_stocks": 0,
+            "beta_failed": [],
+            "beta_skipped": [],
         }
 
-    today = datetime.today()
-    fetch_start = today - timedelta(days=days + 90)
-    fetch_end = today + timedelta(days=1)
-    target_start = (today - timedelta(days=days)).date()
-
-    ticker_to_stock_id = {}
-    stock_to_candidates = {}
-    tickers = []
-    for stock_id, code in stock_rows:
-        candidates = _candidate_ticker_symbols(code)
-        stock_to_candidates[stock_id] = candidates
-        for ticker_symbol in candidates:
-            ticker_to_stock_id[ticker_symbol] = stock_id
-            tickers.append(ticker_symbol)
-
-    updated_rows = 0
-    updated_stocks = 0
-    failed = []
-
-    for batch in _chunked(tickers, batch_size):
-        try:
-            df = yf.download(
-                tickers=batch,
-                start=fetch_start,
-                end=fetch_end,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                progress=False,
-                threads=True,
-            )
-        except Exception as e:
-            # バッチ失敗時は巻き添えを防ぐため、1銘柄ずつ再試行する
-            for ticker in batch:
-                stock_id = ticker_to_stock_id[ticker]
-                try:
-                    single_df = yf.download(
-                        tickers=ticker,
-                        start=fetch_start,
-                        end=fetch_end,
-                        interval="1d",
-                        auto_adjust=False,
-                        progress=False,
-                        threads=False,
-                    )
-                except Exception as se:
-                    failed.append({"ticker": ticker, "reason": f"batch:{e} single:{se}"})
-                    continue
-
-                if single_df is None or single_df.empty:
-                    failed.append({"ticker": ticker, "reason": "No data"})
-                    continue
-
-                try:
-                    stock_df = single_df.copy()
-                    if isinstance(stock_df.columns, pd.MultiIndex):
-                        stock_df.columns = stock_df.columns.get_level_values(0)
-
-                    stock_df = stock_df.reset_index()
-                    if "Date" not in stock_df.columns:
-                        stock_df.rename(columns={stock_df.columns[0]: "Date"}, inplace=True)
-
-                    required_cols = {"Open", "High", "Low", "Close", "Volume"}
-                    if not required_cols.issubset(stock_df.columns):
-                        failed.append({"ticker": ticker, "reason": "Missing OHLCV columns"})
-                        continue
-
-                    stock_df = stock_df.dropna(subset=["Open", "High", "Low", "Close"])
-                    if stock_df.empty:
-                        failed.append({"ticker": ticker, "reason": "All rows are NaN"})
-                        continue
-
-                    stock_df["rsi14"] = calculate_rsi(stock_df, 14)
-                    stock_df["rsi30"] = calculate_rsi(stock_df, 30)
-                    stock_df["rsi60"] = calculate_rsi(stock_df, 60)
-                    stock_df["Date"] = pd.to_datetime(stock_df["Date"]).dt.date
-
-                    target_df = stock_df[stock_df["Date"] >= target_start]
-                    if target_df.empty:
-                        continue
-
-                    inserted_for_stock = 0
-                    for _, row in target_df.iterrows():
-                        con.execute(
-                            """
-                            INSERT OR REPLACE INTO daily_prices
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            [
-                                stock_id,
-                                row["Date"],
-                                float(row["Open"]),
-                                float(row["High"]),
-                                float(row["Low"]),
-                                float(row["Close"]),
-                                int(row["Volume"]) if not pd.isna(row["Volume"]) else None,
-                                float(row["rsi14"]) if not pd.isna(row["rsi14"]) else None,
-                                float(row["rsi30"]) if not pd.isna(row["rsi30"]) else None,
-                                float(row["rsi60"]) if not pd.isna(row["rsi60"]) else None,
-                            ],
-                        )
-                        inserted_for_stock += 1
-
-                    if inserted_for_stock > 0:
-                        updated_stocks += 1
-                        updated_rows += inserted_for_stock
-                except Exception as ie:
-                    failed.append({"ticker": ticker, "reason": str(ie)})
-            continue
-
-        if df is None or df.empty:
-            for ticker in batch:
-                failed.append({"ticker": ticker, "reason": "No data"})
-            continue
-
-        processed_stock_ids = set()
-        for ticker in batch:
-            stock_id = ticker_to_stock_id[ticker]
-            if stock_id in processed_stock_ids:
-                continue
-            try:
-                stock_df = None
-                chosen_ticker = None
-                if isinstance(df.columns, pd.MultiIndex):
-                    available = set(df.columns.get_level_values(0))
-                    for candidate in stock_to_candidates.get(stock_id, []):
-                        if candidate in available:
-                            tmp = df[candidate].copy()
-                            if tmp is not None and not tmp.empty:
-                                stock_df = tmp
-                                chosen_ticker = candidate
-                                break
-                else:
-                    # 単一銘柄レスポンス
-                    stock_df = df.copy()
-                    chosen_ticker = ticker
-
-                if stock_df is None:
-                    failed.append({"ticker": ",".join(stock_to_candidates.get(stock_id, [ticker])), "reason": "Missing ticker in response"})
-                    continue
-
-                if stock_df.empty:
-                    failed.append({"ticker": chosen_ticker or ticker, "reason": "No rows"})
-                    continue
-
-                stock_df = stock_df.reset_index()
-                if "Date" not in stock_df.columns:
-                    stock_df.rename(columns={stock_df.columns[0]: "Date"}, inplace=True)
-
-                required_cols = {"Open", "High", "Low", "Close", "Volume"}
-                if not required_cols.issubset(stock_df.columns):
-                    failed.append({"ticker": chosen_ticker or ticker, "reason": "Missing OHLCV columns"})
-                    continue
-
-                stock_df = stock_df.dropna(subset=["Open", "High", "Low", "Close"])
-                if stock_df.empty:
-                    failed.append({"ticker": chosen_ticker or ticker, "reason": "All rows are NaN"})
-                    continue
-
-                stock_df["rsi14"] = calculate_rsi(stock_df, 14)
-                stock_df["rsi30"] = calculate_rsi(stock_df, 30)
-                stock_df["rsi60"] = calculate_rsi(stock_df, 60)
-                stock_df["Date"] = pd.to_datetime(stock_df["Date"]).dt.date
-
-                target_df = stock_df[stock_df["Date"] >= target_start]
-                if target_df.empty:
-                    continue
-
-                inserted_for_stock = 0
-                for _, row in target_df.iterrows():
-                    con.execute(
-                        """
-                        INSERT OR REPLACE INTO daily_prices
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        [
-                            stock_id,
-                            row["Date"],
-                            float(row["Open"]),
-                            float(row["High"]),
-                            float(row["Low"]),
-                            float(row["Close"]),
-                            int(row["Volume"]) if not pd.isna(row["Volume"]) else None,
-                            float(row["rsi14"]) if not pd.isna(row["rsi14"]) else None,
-                            float(row["rsi30"]) if not pd.isna(row["rsi30"]) else None,
-                            float(row["rsi60"]) if not pd.isna(row["rsi60"]) else None,
-                        ],
-                    )
-                    inserted_for_stock += 1
-
-                if inserted_for_stock > 0:
-                    updated_stocks += 1
-                    updated_rows += inserted_for_stock
-                processed_stock_ids.add(stock_id)
-
-            except Exception as e:
-                failed.append({"ticker": ticker, "reason": str(e)})
+    daily_result = _update_daily_prices_batch(
+        con,
+        stock_rows,
+        days=days,
+        batch_size=batch_size,
+    )
+    beta_result = _update_beta_batch(
+        con,
+        stock_rows,
+        batch_size=batch_size,
+    )
 
     con.commit()
     con.close()
 
+    logger.info(
+        "update_all_daily_data completed daily_success=%s beta_success=%s",
+        daily_result["updated_stocks"],
+        beta_result["updated_stocks"],
+    )
+
     return {
-        "message": "Daily data updated",
+        "message": "Daily data and beta updated",
         "days": days,
         "total_stocks": len(stock_rows),
-        "updated_stocks": updated_stocks,
-        "updated_rows": updated_rows,
-        "failed": failed,
+        "updated_stocks": daily_result["updated_stocks"],
+        "updated_rows": daily_result["updated_rows"],
+        "failed": daily_result["failed"],
+        "beta_updated_stocks": beta_result["updated_stocks"],
+        "beta_failed": beta_result["failed"],
+        "beta_skipped": beta_result["skipped"],
+        "beta_calc_date": beta_result["calc_date"],
     }
 
 def update_quarterly_earnings(stock_id: int, code: str):
@@ -881,6 +1194,19 @@ def _ensure_kabutan_table(con):
     )
 
 
+def _ensure_stock_metrics_table(con):
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stock_metrics (
+            company_id INTEGER,
+            beta DOUBLE,
+            calc_date DATE,
+            UNIQUE (company_id, calc_date)
+        )
+        """
+    )
+
+
 def _latest_value(values):
     if not values:
         return None
@@ -1038,26 +1364,42 @@ def update_stock_info(stock_id: int, code: str):
 def get_stock_info(stock_id: int):
 
     con = get_connection()
+    _ensure_stock_metrics_table(con)
     row = con.execute(
         """
+        WITH latest_metrics AS (
+            SELECT
+                company_id,
+                beta,
+                calc_date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY company_id
+                    ORDER BY calc_date DESC
+                ) AS rn
+            FROM stock_metrics
+        )
         SELECT
-            stock_id,
-            long_name,
-            short_name,
-            sector,
-            industry,
-            market_cap,
-            trailing_pe,
-            forward_pe,
-            dividend_yield,
-            beta,
-            website,
-            business_summary,
-            currency,
-            country,
-            updated_at
-        FROM stock_info
-        WHERE stock_id = ?
+            si.stock_id,
+            si.long_name,
+            si.short_name,
+            si.sector,
+            si.industry,
+            si.market_cap,
+            si.trailing_pe,
+            si.forward_pe,
+            si.dividend_yield,
+            COALESCE(lm.beta, si.beta) AS beta,
+            si.website,
+            si.business_summary,
+            si.currency,
+            si.country,
+            si.updated_at,
+            lm.calc_date
+        FROM stock_info si
+        LEFT JOIN latest_metrics lm
+            ON si.stock_id = lm.company_id
+           AND lm.rn = 1
+        WHERE si.stock_id = ?
         """,
         [stock_id],
     ).fetchone()
@@ -1082,6 +1424,7 @@ def get_stock_info(stock_id: int):
         "currency": row[12],
         "country": row[13],
         "updated_at": row[14],
+        "beta_calc_date": row[15],
     }
 
 

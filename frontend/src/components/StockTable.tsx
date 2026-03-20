@@ -22,6 +22,8 @@ type Stock = {
   rsi14?: number | null
   rsi30?: number | null
   rsi60?: number | null
+  beta?: number | null
+  beta_calc_date?: string | null
   minkabu_target_price?: number | null
   minkabu_target_rating?: string | null
   minkabu_theoretical_price?: number | null
@@ -377,7 +379,7 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
     })
   }
 
-  const tableColumnCount = 10
+  const tableColumnCount = 11
 
   const renderActionStack = (stockId: number, isEdited: boolean, isDetailRow: boolean) => (
     <div className="action-stack">
@@ -595,6 +597,12 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
             </th>
             <th>
               <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("beta")}>{"β(週次)"}</button>
+                <button type="button" className="header-action header-muted" onClick={() => handleSort("beta_calc_date")}>{"計算日"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
                 <button type="button" className="header-action" onClick={() => handleSort("minkabu_target_rating")}>{"目標評価：目標株価"}</button>
                 <button type="button" className="header-action" onClick={() => handleSort("minkabu_theoretical_price")}>{"理論株価"}</button>
                 <button type="button" className="header-action" onClick={() => handleSort("minkabu_individual_rating")}>{"個人評価：個人予想株価"}</button>
@@ -654,6 +662,9 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                       </td>
                       <td className={`compact-value-cell ${getRsiClass(stock.rsi14)}`}>
                         {fmtFixed(stock.rsi14)}
+                      </td>
+                      <td className="compact-value-cell">
+                        {fmtFixed(stock.beta)}
                       </td>
                       <td className="compact-rating-cell">
                         <span className={`cell-badge ${getRatingClass(stock.minkabu_target_rating)}`}>
@@ -765,6 +776,16 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                       <div className={`cell-line ${getRsiClass(stock.rsi14)}`}>{fmtFixed(stock.rsi14)}</div>
                       <div className={`cell-line ${getRsiClass(stock.rsi30)}`}>{fmtFixed(stock.rsi30)}</div>
                       <div className={`cell-line ${getRsiClass(stock.rsi60)}`}>{fmtFixed(stock.rsi60)}</div>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="cell-stack compact-stack">
+                      <div className="cell-line highlight-line">
+                        <span className="highlight-value">{fmtFixed(stock.beta)}</span>
+                      </div>
+                      <div className="cell-line">
+                        <span className="cell-date">{fmtDate(stock.beta_calc_date)}</span>
+                      </div>
                     </div>
                   </td>
                   <td>

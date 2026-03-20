@@ -22,6 +22,8 @@ type Stock = {
   rsi14?: number | null
   rsi30?: number | null
   rsi60?: number | null
+  beta?: number | null
+  beta_calc_date?: string | null
   minkabu_target_price?: number | null
   minkabu_target_rating?: string | null
   minkabu_theoretical_price?: number | null
@@ -278,7 +280,9 @@ function App() {
         return
       }
       const data = await res.json()
-      setUpdateAllMessage(`更新完了: ${data.updated_stocks}銘柄 / ${data.updated_rows}件`)
+      setUpdateAllMessage(
+        `更新完了: 株価 ${data.updated_stocks}銘柄 / ${data.updated_rows}件, β ${data.beta_updated_stocks ?? 0}銘柄, β失敗 ${data.beta_failed?.length ?? 0}件`
+      )
       fetchStocks()
     } catch {
       setUpdateAllMessage("更新に失敗しました")
@@ -355,6 +359,8 @@ function App() {
       "rsi14",
       "rsi30",
       "rsi60",
+      "beta",
+      "beta_calc_date",
       "minkabu_target_price",
       "minkabu_target_rating",
       "minkabu_theoretical_price",
@@ -397,6 +403,8 @@ function App() {
       s.rsi14 ?? "",
       s.rsi30 ?? "",
       s.rsi60 ?? "",
+      s.beta ?? "",
+      s.beta_calc_date ?? "",
       s.minkabu_target_price ?? "",
       s.minkabu_target_rating ?? "",
       s.minkabu_theoretical_price ?? "",
@@ -448,7 +456,7 @@ function App() {
               onClick={updateAllDaily}
               disabled={isUpdatingAllDaily}
             >
-              {isUpdatingAllDaily ? "\u66f4\u65b0\u4e2d..." : "\u5168\u92d8\u67c4\u0037\u65e5\u5206\u0044\u0042\u66f4\u65b0"}
+              {isUpdatingAllDaily ? "\u66f4\u65b0\u4e2d..." : "\u5168\u92d8\u67c4\u0037\u65e5\u5206\u0044\u0042\u66f4\u65b0\u002b\u03b2\u8a08\u7b97"}
             </button>
             <button
               className="save"

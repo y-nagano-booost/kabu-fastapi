@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS stock_info (
 )
 """)
 con.execute("""
+CREATE TABLE IF NOT EXISTS stock_metrics (
+    company_id INTEGER,
+    beta DOUBLE,
+    calc_date DATE,
+    UNIQUE (company_id, calc_date)
+)
+""")
+con.execute("""
 CREATE TABLE IF NOT EXISTS trade_history (
     stock_id INTEGER,
     trade_date DATE,

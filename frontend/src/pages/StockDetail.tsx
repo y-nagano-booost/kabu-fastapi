@@ -49,6 +49,7 @@ type StockInfo = {
   forward_pe: number | null
   dividend_yield: number | null
   beta: number | null
+  beta_calc_date: string | null
   website: string | null
   business_summary: string | null
   currency: string | null
@@ -393,6 +394,11 @@ export default function StockDetail() {
     return `${percent.toFixed(digits)}%`
   }
 
+  const fmtDateValue = (value: string | null) => {
+    if (!value) return "-"
+    return value.slice(0, 10)
+  }
+
   const filteredStocks = stocks
     .filter((s) => {
       const q = stockFilter.trim().toLowerCase()
@@ -500,7 +506,8 @@ export default function StockDetail() {
                 <tr><th>PER(実績)</th><td>{fmt(stockInfo.trailing_pe, 2)}</td></tr>
                 <tr><th>PER(予想)</th><td>{fmt(stockInfo.forward_pe, 2)}</td></tr>
                 <tr><th>配当利回り</th><td>{fmtPercent(stockInfo.dividend_yield, 2)}</td></tr>
-                <tr><th>β</th><td>{fmt(stockInfo.beta, 2)}</td></tr>
+                <tr><th>β(週次/2年)</th><td>{fmt(stockInfo.beta, 2)}</td></tr>
+                <tr><th>β計算日</th><td>{fmtDateValue(stockInfo.beta_calc_date)}</td></tr>
                 <tr><th>通貨</th><td>{stockInfo.currency || "-"}</td></tr>
                 <tr><th>国</th><td>{stockInfo.country || "-"}</td></tr>
                 <tr>

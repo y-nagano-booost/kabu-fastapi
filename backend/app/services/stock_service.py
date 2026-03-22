@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-TOPIX_TICKER = "^TOPX"
+TOPIX_TICKER_CANDIDATES = ["^TOPX", "1306.T", "1348.T", "1475.T"]
 YFINANCE_MAX_RETRIES = 3
 YFINANCE_RETRY_DELAY_SECONDS = 1
 BETA_LOOKBACK_DAYS = 365 * 2
@@ -20,6 +20,73 @@ BETA_FETCH_BUFFER_DAYS = 30
 BETA_HISTORY_START_TOLERANCE_DAYS = 30
 BETA_HISTORY_END_TOLERANCE_DAYS = 14
 BETA_MIN_WEEKLY_POINTS = 52
+BETA_SHORT_LOOKBACK_DAYS = 90
+BETA_SHORT_MIN_WEEKLY_POINTS = 8
+
+
+def _calculate_current_fiscal_quarter(fiscal_year_end_month: Optional[int]):
+    if fiscal_year_end_month is None:
+        return None
+    if fiscal_year_end_month < 1 or fiscal_year_end_month > 12:
+        return None
+
+    current_month = datetime.now().month
+    fiscal_year_start_month = (fiscal_year_end_month % 12) + 1
+    month_offset = (current_month - fiscal_year_start_month) % 12
+    return month_offset // 3 + 1
+
+
+def _parse_fiscal_year_end_month(raw_value):
+    if raw_value is None:
+        return None
+
+    try:
+        if isinstance(raw_value, (int, float)):
+            value = int(raw_value)
+            if 1 <= value <= 12:
+                return value
+            if 100 <= value <= 1231:
+                month = value // 100
+                if 1 <= month <= 12:
+                    return month
+        text = str(raw_value).strip()
+        if not text:
+            return None
+        numeric = int(float(text))
+        if 1 <= numeric <= 12:
+            return numeric
+        if 100 <= numeric <= 1231:
+            month = numeric // 100
+            if 1 <= month <= 12:
+                return month
+    except (TypeError, ValueError):
+        return None
+
+    return None
+
+
+def _extract_fiscal_year_end_month_from_info(info: dict):
+    fiscal_year_end_month = _parse_fiscal_year_end_month(
+        info.get("fiscalYearEnd")
+    )
+    if fiscal_year_end_month is None:
+        fiscal_year_end_month = _parse_fiscal_year_end_month(
+            info.get("nextFiscalYearEnd")
+        )
+    if fiscal_year_end_month is None:
+        fiscal_year_end_month = _parse_fiscal_year_end_month(
+            info.get("lastFiscalYearEnd")
+        )
+    if fiscal_year_end_month is None:
+        last_fiscal_year_end = _to_float_or_none(info.get("lastFiscalYearEnd"))
+        if last_fiscal_year_end is not None:
+            try:
+                fiscal_year_end_month = datetime.fromtimestamp(
+                    int(last_fiscal_year_end)
+                ).month
+            except (OverflowError, OSError, ValueError):
+                fiscal_year_end_month = None
+    return fiscal_year_end_month
 
 
 def _candidate_ticker_symbols(code: str):
@@ -90,6 +157,7 @@ def _build_trade_metrics(trade_rows):
 
 def get_all_stocks():
     con = get_connection()
+    _ensure_stock_info_table(con)
     _ensure_minkabu_table(con)
     _ensure_kabutan_table(con)
     _ensure_stock_metrics_table(con)
@@ -122,6 +190,11 @@ def get_all_stocks():
                 individual_rating,
                 analyst_price,
                 analyst_rating,
+                eps_growth_yoy,
+                eps_growth_3y_avg,
+                forecast_eps_growth,
+                peg,
+                per,
                 fetched_date,
                 updated_at,
                 ROW_NUMBER() OVER (
@@ -148,6 +221,7 @@ def get_all_stocks():
             SELECT
                 company_id,
                 beta,
+                beta_3m,
                 calc_date,
                 ROW_NUMBER() OVER (
                     PARTITION BY company_id
@@ -180,13 +254,20 @@ def get_all_stocks():
             lm.individual_rating,
             lm.analyst_price,
             lm.analyst_rating,
+            lm.eps_growth_yoy,
+            lm.eps_growth_3y_avg,
+            lm.forecast_eps_growth,
+            lm.peg,
+            lm.per,
             lm.fetched_date,
             lk.yield_total,
             lk.yield_benefit,
             lk.yield_dividend,
             lk.fetched_date,
             lmt.beta,
-            lmt.calc_date
+            lmt.beta_3m,
+            lmt.calc_date,
+            si.fiscal_year_end_month
         FROM stocks s
         LEFT JOIN latest_daily ld
             ON s.id = ld.stock_id
@@ -200,6 +281,8 @@ def get_all_stocks():
         LEFT JOIN latest_metrics lmt
             ON s.id = lmt.company_id
            AND lmt.rn = 1
+        LEFT JOIN stock_info si
+            ON s.id = si.stock_id
         ORDER BY favorite DESC, code
     """).fetchall()
     trade_rows = con.execute("""
@@ -269,13 +352,21 @@ def get_all_stocks():
             "minkabu_individual_rating": r[18],
             "minkabu_analyst_price": r[19],
             "minkabu_analyst_rating": r[20],
-            "minkabu_fetched_date": r[21],
-            "kabutan_total_yield": r[22],
-            "kabutan_benefit_yield": r[23],
-            "kabutan_dividend_yield": r[24],
-            "kabutan_fetched_date": r[25],
-            "beta": r[26],
-            "beta_calc_date": r[27],
+            "minkabu_eps_growth_yoy": r[21],
+            "minkabu_eps_growth_3y_avg": r[22],
+            "minkabu_forecast_eps_growth": r[23],
+            "minkabu_peg": r[24],
+            "minkabu_per": r[25],
+            "minkabu_fetched_date": r[26],
+            "kabutan_total_yield": r[27],
+            "kabutan_benefit_yield": r[28],
+            "kabutan_dividend_yield": r[29],
+            "kabutan_fetched_date": r[30],
+            "beta": r[31],
+            "beta_3m": r[32],
+            "beta_calc_date": r[33],
+            "fiscal_year_end_month": r[34],
+            "current_fiscal_quarter": _calculate_current_fiscal_quarter(r[34]),
         }
         for r in rows
     ]
@@ -597,6 +688,10 @@ def _extract_history_frame(downloaded_df, ticker_symbol: str):
     normalized = _normalize_history_frame(history_df)
     if normalized is None or normalized.empty:
         return None, "No rows"
+    if "Close" not in normalized.columns:
+        return None, "Missing Close column"
+    if normalized["Close"].dropna().empty:
+        return None, "No close data"
     return normalized, None
 
 
@@ -680,7 +775,7 @@ def _insert_daily_rows(con, stock_id: int, history_df, target_start):
     return inserted
 
 
-def _prepare_weekly_returns(history_df, required_start, required_end):
+def _prepare_weekly_returns(history_df, required_start, required_end, min_weekly_points=BETA_MIN_WEEKLY_POINTS):
     if history_df is None or history_df.empty:
         return None, "No rows"
     if "Close" not in history_df.columns:
@@ -696,24 +791,24 @@ def _prepare_weekly_returns(history_df, required_start, required_end):
     if close_series.empty:
         return None, "No close data"
 
-    allowed_start = required_start + timedelta(days=BETA_HISTORY_START_TOLERANCE_DAYS)
-    allowed_end = required_end - timedelta(days=BETA_HISTORY_END_TOLERANCE_DAYS)
+    allowed_start = (required_start + timedelta(days=BETA_HISTORY_START_TOLERANCE_DAYS)).date()
+    allowed_end = (required_end - timedelta(days=BETA_HISTORY_END_TOLERANCE_DAYS)).date()
 
-    first_date = close_series.index.min().to_pydatetime()
-    last_date = close_series.index.max().to_pydatetime()
+    first_date = close_series.index.min().date()
+    last_date = close_series.index.max().date()
     if first_date > allowed_start:
-        return None, f"Insufficient history start={first_date.date().isoformat()}"
+        return None, f"Insufficient history start={first_date.isoformat()}"
     if last_date < allowed_end:
-        return None, f"Insufficient history end={last_date.date().isoformat()}"
+        return None, f"Insufficient history end={last_date.isoformat()}"
 
     weekly_returns = close_series.resample("W").last().pct_change().dropna()
-    if len(weekly_returns) < BETA_MIN_WEEKLY_POINTS:
+    if len(weekly_returns) < min_weekly_points:
         return None, f"Insufficient weekly returns ({len(weekly_returns)})"
 
     return weekly_returns, None
 
 
-def _calculate_beta_from_returns(stock_returns, market_returns):
+def _calculate_beta_from_returns(stock_returns, market_returns, min_weekly_points=BETA_MIN_WEEKLY_POINTS):
     aligned = pd.concat(
         [
             stock_returns.rename("stock"),
@@ -723,7 +818,7 @@ def _calculate_beta_from_returns(stock_returns, market_returns):
         join="inner",
     ).dropna()
 
-    if len(aligned) < BETA_MIN_WEEKLY_POINTS:
+    if len(aligned) < min_weekly_points:
         return None, f"Insufficient aligned weekly returns ({len(aligned)})"
 
     market_variance = aligned["market"].var()
@@ -816,13 +911,13 @@ def _update_daily_prices_batch(con, stock_rows, days: int, batch_size: int):
     }
 
 
-def _upsert_stock_metric(con, company_id: int, beta: float, calc_date):
+def _upsert_stock_metric(con, company_id: int, beta: Optional[float], beta_3m: Optional[float], calc_date):
     con.execute(
         """
-        INSERT OR REPLACE INTO stock_metrics (company_id, beta, calc_date)
-        VALUES (?, ?, ?)
+        INSERT OR REPLACE INTO stock_metrics (company_id, beta, beta_3m, calc_date)
+        VALUES (?, ?, ?, ?)
         """,
-        [company_id, beta, calc_date],
+        [company_id, beta, beta_3m, calc_date],
     )
 
 
@@ -830,6 +925,7 @@ def _update_beta_batch(con, stock_rows, batch_size: int):
     calc_date = datetime.today().date()
     required_end = datetime.today()
     required_start = required_end - timedelta(days=BETA_LOOKBACK_DAYS)
+    required_start_short = required_end - timedelta(days=BETA_SHORT_LOOKBACK_DAYS)
     fetch_start = required_start - timedelta(days=BETA_FETCH_BUFFER_DAYS)
     fetch_end = required_end + timedelta(days=1)
 
@@ -842,13 +938,14 @@ def _update_beta_batch(con, stock_rows, batch_size: int):
             stock_id: _candidate_ticker_symbols(code)
             for stock_id, code in stock_batch
         }
+        market_candidates = TOPIX_TICKER_CANDIDATES
         batch_tickers = _dedupe_tickers(
             [
                 ticker_symbol
                 for candidates in batch_candidates.values()
                 for ticker_symbol in candidates
             ]
-            + [TOPIX_TICKER]
+            + market_candidates
         )
         batch_df, batch_error = _download_history_batch(
             batch_tickers,
@@ -857,17 +954,20 @@ def _update_beta_batch(con, stock_rows, batch_size: int):
             interval="1d",
         )
 
-        market_history_df, _, market_reason = _select_history_frame(batch_df, [TOPIX_TICKER])
+        market_history_df, market_ticker, market_reason = _select_history_frame(
+            batch_df,
+            market_candidates,
+        )
         if market_history_df is None:
             market_fallback_df, fallback_error = _download_history_batch(
-                [TOPIX_TICKER],
+                market_candidates,
                 start=fetch_start,
                 end=fetch_end,
                 interval="1d",
             )
-            market_history_df, _, market_reason = _select_history_frame(
+            market_history_df, market_ticker, market_reason = _select_history_frame(
                 market_fallback_df,
-                [TOPIX_TICKER],
+                market_candidates,
             )
             if market_history_df is None:
                 failed_reason = market_reason or fallback_error or batch_error or "Market download failed"
@@ -876,7 +976,7 @@ def _update_beta_batch(con, stock_rows, batch_size: int):
                         {
                             "company_id": stock_id,
                             "code": code,
-                            "ticker": TOPIX_TICKER,
+                            "ticker": market_ticker or ",".join(market_candidates),
                             "reason": failed_reason,
                         }
                     )
@@ -887,14 +987,20 @@ def _update_beta_batch(con, stock_rows, batch_size: int):
             required_start,
             required_end,
         )
-        if market_returns is None:
+        market_returns_short, market_reason_short = _prepare_weekly_returns(
+            market_history_df,
+            required_start_short,
+            required_end,
+            min_weekly_points=BETA_SHORT_MIN_WEEKLY_POINTS,
+        )
+        if market_returns is None and market_returns_short is None:
             for stock_id, code in stock_batch:
                 failed.append(
                     {
                         "company_id": stock_id,
                         "code": code,
-                        "ticker": TOPIX_TICKER,
-                        "reason": market_reason or "TOPIX weekly returns unavailable",
+                        "ticker": market_ticker or ",".join(market_candidates),
+                        "reason": market_reason or market_reason_short or "Market weekly returns unavailable",
                     }
                 )
             continue
@@ -928,30 +1034,50 @@ def _update_beta_batch(con, stock_rows, batch_size: int):
                 required_start,
                 required_end,
             )
-            if stock_returns is None:
+            stock_returns_short, reason_short = _prepare_weekly_returns(
+                history_df,
+                required_start_short,
+                required_end,
+                min_weekly_points=BETA_SHORT_MIN_WEEKLY_POINTS,
+            )
+
+            beta = None
+            beta_reason = None
+            if stock_returns is not None and market_returns is not None:
+                beta, beta_reason = _calculate_beta_from_returns(stock_returns, market_returns)
+            elif stock_returns is None:
+                beta_reason = reason or "Insufficient long-term history"
+            else:
+                beta_reason = market_reason or "Market long-term returns unavailable"
+
+            beta_3m = None
+            beta_3m_reason = None
+            if stock_returns_short is not None and market_returns_short is not None:
+                beta_3m, beta_3m_reason = _calculate_beta_from_returns(
+                    stock_returns_short,
+                    market_returns_short,
+                    min_weekly_points=BETA_SHORT_MIN_WEEKLY_POINTS,
+                )
+            elif stock_returns_short is None:
+                beta_3m_reason = reason_short or "Insufficient 3-month history"
+            else:
+                beta_3m_reason = market_reason_short or "Market 3-month returns unavailable"
+
+            if beta is None and beta_3m is None:
+                reason_joined = " / ".join(
+                    [r for r in [beta_reason, beta_3m_reason] if r]
+                ) or "Unable to calculate beta"
                 skipped.append(
                     {
                         "company_id": stock_id,
                         "code": code,
                         "ticker": used_ticker or ",".join(candidates),
-                        "reason": reason or "Insufficient history",
+                        "reason": reason_joined,
                     }
                 )
                 continue
 
-            beta, reason = _calculate_beta_from_returns(stock_returns, market_returns)
-            if beta is None:
-                skipped.append(
-                    {
-                        "company_id": stock_id,
-                        "code": code,
-                        "ticker": used_ticker or ",".join(candidates),
-                        "reason": reason or "Unable to calculate beta",
-                    }
-                )
-                continue
-
-            _upsert_stock_metric(con, stock_id, beta, calc_date)
+            _upsert_stock_metric(con, stock_id, beta, beta_3m, calc_date)
             updated_stocks += 1
 
     logger.info(
@@ -1003,14 +1129,20 @@ def update_all_daily_data(days: int = 7, batch_size: int = 50):
         stock_rows,
         batch_size=batch_size,
     )
+    fiscal_info_result = _update_fiscal_year_end_month_batch(
+        con,
+        stock_rows,
+        batch_size=batch_size,
+    )
 
     con.commit()
     con.close()
 
     logger.info(
-        "update_all_daily_data completed daily_success=%s beta_success=%s",
+        "update_all_daily_data completed daily_success=%s beta_success=%s fiscal_success=%s",
         daily_result["updated_stocks"],
         beta_result["updated_stocks"],
+        fiscal_info_result["updated_stocks"],
     )
 
     return {
@@ -1024,6 +1156,9 @@ def update_all_daily_data(days: int = 7, batch_size: int = 50):
         "beta_failed": beta_result["failed"],
         "beta_skipped": beta_result["skipped"],
         "beta_calc_date": beta_result["calc_date"],
+        "fiscal_info_updated_stocks": fiscal_info_result["updated_stocks"],
+        "fiscal_info_failed": fiscal_info_result["failed"],
+        "fiscal_info_skipped": fiscal_info_result["skipped"],
     }
 
 def update_quarterly_earnings(stock_id: int, code: str):
@@ -1168,6 +1303,11 @@ def _ensure_minkabu_table(con):
             individual_rating VARCHAR,
             analyst_price DOUBLE,
             analyst_rating VARCHAR,
+            eps_growth_yoy DOUBLE,
+            eps_growth_3y_avg DOUBLE,
+            forecast_eps_growth DOUBLE,
+            peg DOUBLE,
+            per DOUBLE,
             fetched_date DATE,
             source_url VARCHAR,
             updated_at TIMESTAMP,
@@ -1175,6 +1315,11 @@ def _ensure_minkabu_table(con):
         )
         """
     )
+    con.execute("ALTER TABLE minkabu_forecasts ADD COLUMN IF NOT EXISTS eps_growth_yoy DOUBLE")
+    con.execute("ALTER TABLE minkabu_forecasts ADD COLUMN IF NOT EXISTS eps_growth_3y_avg DOUBLE")
+    con.execute("ALTER TABLE minkabu_forecasts ADD COLUMN IF NOT EXISTS forecast_eps_growth DOUBLE")
+    con.execute("ALTER TABLE minkabu_forecasts ADD COLUMN IF NOT EXISTS peg DOUBLE")
+    con.execute("ALTER TABLE minkabu_forecasts ADD COLUMN IF NOT EXISTS per DOUBLE")
 
 
 def _ensure_kabutan_table(con):
@@ -1200,11 +1345,38 @@ def _ensure_stock_metrics_table(con):
         CREATE TABLE IF NOT EXISTS stock_metrics (
             company_id INTEGER,
             beta DOUBLE,
+            beta_3m DOUBLE,
             calc_date DATE,
             UNIQUE (company_id, calc_date)
         )
         """
     )
+    con.execute("ALTER TABLE stock_metrics ADD COLUMN IF NOT EXISTS beta_3m DOUBLE")
+
+
+def _ensure_stock_info_table(con):
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stock_info (
+            stock_id INTEGER PRIMARY KEY,
+            long_name VARCHAR,
+            short_name VARCHAR,
+            sector VARCHAR,
+            industry VARCHAR,
+            market_cap DOUBLE,
+            trailing_pe DOUBLE,
+            forward_pe DOUBLE,
+            dividend_yield DOUBLE,
+            beta DOUBLE,
+            website VARCHAR,
+            business_summary VARCHAR,
+            currency VARCHAR,
+            country VARCHAR,
+            updated_at TIMESTAMP
+        )
+        """
+    )
+    con.execute("ALTER TABLE stock_info ADD COLUMN IF NOT EXISTS fiscal_year_end_month INTEGER")
 
 
 def _latest_value(values):
@@ -1315,7 +1487,10 @@ def update_stock_info(stock_id: int, code: str):
     if not info:
         return {"message": "No info data"}
 
+    fiscal_year_end_month = _extract_fiscal_year_end_month_from_info(info)
+
     con = get_connection()
+    _ensure_stock_info_table(con)
     con.execute(
         """
         INSERT OR REPLACE INTO stock_info (
@@ -1333,9 +1508,10 @@ def update_stock_info(stock_id: int, code: str):
             business_summary,
             currency,
             country,
+            fiscal_year_end_month,
             updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             stock_id,
@@ -1352,6 +1528,7 @@ def update_stock_info(stock_id: int, code: str):
             info.get("longBusinessSummary"),
             info.get("currency"),
             info.get("country"),
+            fiscal_year_end_month,
             datetime.now(),
         ],
     )
@@ -1361,9 +1538,87 @@ def update_stock_info(stock_id: int, code: str):
     return {"message": "Stock info updated"}
 
 
+def _update_fiscal_year_end_month_batch(con, stock_rows, batch_size: int):
+    _ensure_stock_info_table(con)
+    failed = []
+    skipped = []
+    updated_stocks = 0
+    now = datetime.now()
+
+    for i in range(0, len(stock_rows), batch_size):
+        chunk = stock_rows[i:i + batch_size]
+        for stock_id, code in chunk:
+            try:
+                info = {}
+                used_ticker = None
+                for ticker_symbol in _candidate_ticker_symbols(str(code)):
+                    ticker = yf.Ticker(ticker_symbol)
+                    candidate = ticker.info or {}
+                    if candidate:
+                        info = candidate
+                        used_ticker = ticker_symbol
+                        break
+
+                if not info:
+                    skipped.append(
+                        {
+                            "company_id": stock_id,
+                            "code": code,
+                            "ticker": None,
+                            "reason": "No info data",
+                        }
+                    )
+                    continue
+
+                fiscal_year_end_month = _extract_fiscal_year_end_month_from_info(info)
+                if fiscal_year_end_month is None:
+                    skipped.append(
+                        {
+                            "company_id": stock_id,
+                            "code": code,
+                            "ticker": used_ticker,
+                            "reason": "No fiscal year end month",
+                        }
+                    )
+                    continue
+
+                con.execute(
+                    """
+                    INSERT INTO stock_info (stock_id, fiscal_year_end_month, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (stock_id) DO UPDATE SET
+                        fiscal_year_end_month = EXCLUDED.fiscal_year_end_month,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    [stock_id, fiscal_year_end_month, now],
+                )
+                updated_stocks += 1
+            except Exception as e:  # noqa: BLE001
+                failed.append(
+                    {
+                        "company_id": stock_id,
+                        "code": code,
+                        "reason": str(e),
+                    }
+                )
+
+    logger.info(
+        "fiscal month batch completed success=%s skipped=%s failed=%s",
+        updated_stocks,
+        len(skipped),
+        len(failed),
+    )
+    return {
+        "updated_stocks": updated_stocks,
+        "failed": failed,
+        "skipped": skipped,
+    }
+
+
 def get_stock_info(stock_id: int):
 
     con = get_connection()
+    _ensure_stock_info_table(con)
     _ensure_stock_metrics_table(con)
     row = con.execute(
         """
@@ -1393,6 +1648,7 @@ def get_stock_info(stock_id: int):
             si.business_summary,
             si.currency,
             si.country,
+            si.fiscal_year_end_month,
             si.updated_at,
             lm.calc_date
         FROM stock_info si
@@ -1423,9 +1679,205 @@ def get_stock_info(stock_id: int):
         "business_summary": row[11],
         "currency": row[12],
         "country": row[13],
-        "updated_at": row[14],
-        "beta_calc_date": row[15],
+        "fiscal_year_end_month": row[14],
+        "current_fiscal_quarter": _calculate_current_fiscal_quarter(row[14]),
+        "updated_at": row[15],
+        "beta_calc_date": row[16],
     }
+
+
+def update_stock_info_all():
+    con = get_connection()
+    _ensure_stock_info_table(con)
+    stock_rows = con.execute(
+        """
+        SELECT id, code
+        FROM stocks
+        ORDER BY id
+        """
+    ).fetchall()
+    con.close()
+
+    updated = 0
+    failed = []
+
+    for stock_id, code in stock_rows:
+        try:
+            result = update_stock_info(stock_id, code)
+            if result.get("message") == "Stock info updated":
+                updated += 1
+            else:
+                failed.append(
+                    {
+                        "stock_id": stock_id,
+                        "code": code,
+                        "reason": result.get("message", "No info data"),
+                    }
+                )
+        except Exception as e:
+            failed.append(
+                {
+                    "stock_id": stock_id,
+                    "code": code,
+                    "reason": str(e),
+                }
+            )
+
+    return {
+        "message": "Stock info updated",
+        "total_stocks": len(stock_rows),
+        "updated_stocks": updated,
+        "failed": failed,
+    }
+
+
+def _parse_number_from_text(text: Optional[str]):
+    if text is None:
+        return None
+    normalized = str(text).strip().replace(",", "")
+    normalized = normalized.replace("?", "%")
+    normalized = normalized.replace("?", "-")
+    normalized = normalized.replace("?", "-")
+    m = re.search(r"-?[0-9]+(?:\.[0-9]+)?", normalized)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_minkabu_per(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    for tr in soup.select("table tr"):
+        th = tr.find("th")
+        td = tr.find("td")
+        if not th or not td:
+            continue
+        label = th.get_text(" ", strip=True)
+        if "PER" not in label.upper():
+            continue
+        return _parse_number_from_text(td.get_text(" ", strip=True))
+    return None
+
+
+def _safe_growth_rate(new_value: Optional[float], old_value: Optional[float]):
+    if new_value is None or old_value is None:
+        return None
+    if old_value == 0:
+        return None
+    return (new_value - old_value) / abs(old_value)
+
+
+def _extract_eps_values_from_yfinance(code: str):
+    for ticker_symbol in _candidate_ticker_symbols(code):
+        try:
+            stmt = yf.Ticker(ticker_symbol).quarterly_income_stmt
+        except Exception:
+            continue
+
+        if stmt is None or stmt.empty:
+            continue
+
+        try:
+            df = stmt.T.sort_index(ascending=False)
+            eps_series = None
+            for col in ("Diluted EPS", "Basic EPS"):
+                if col in df.columns:
+                    eps_series = df[col]
+                    break
+            if eps_series is None:
+                continue
+            vals = [float(v) for v in eps_series.dropna().tolist()]
+            if vals:
+                return vals
+        except Exception:
+            continue
+
+    return []
+
+
+def _compute_eps_growth_metrics(con, stock_id: int, code: str):
+    eps_values = []
+    try:
+        eps_rows = con.execute(
+            """
+            SELECT fiscal_period_end, eps
+            FROM earnings
+            WHERE stock_id = ? AND eps IS NOT NULL
+            ORDER BY fiscal_period_end DESC
+            LIMIT 20
+            """,
+            [stock_id],
+        ).fetchall()
+        eps_values = [float(r[1]) for r in eps_rows if r[1] is not None]
+    except Exception:
+        eps_values = []
+
+    # Fallback: when local earnings are not populated, fetch quarterly EPS directly.
+    if len(eps_values) < 8:
+        eps_values = _extract_eps_values_from_yfinance(code)
+
+    if len(eps_values) < 8:
+        return {"eps_growth_yoy": None, "eps_growth_3y_avg": None}
+
+    latest_4 = sum(eps_values[0:4])
+    prev_4 = sum(eps_values[4:8])
+    eps_growth_yoy = _safe_growth_rate(latest_4, prev_4)
+
+    eps_growth_3y_avg = None
+    if len(eps_values) >= 16:
+        latest_year = sum(eps_values[0:4])
+        three_years_ago = sum(eps_values[12:16])
+        if latest_year is not None and three_years_ago not in (None, 0) and latest_year > 0 and three_years_ago > 0:
+            eps_growth_3y_avg = (latest_year / three_years_ago) ** (1 / 3) - 1
+
+    return {
+        "eps_growth_yoy": eps_growth_yoy,
+        "eps_growth_3y_avg": eps_growth_3y_avg,
+    }
+
+
+def _fetch_yfinance_growth_metrics(code: str):
+    for ticker_symbol in _candidate_ticker_symbols(code):
+        try:
+            info = yf.Ticker(ticker_symbol).info or {}
+        except Exception:
+            continue
+
+        forecast_growth = _to_float_or_none(info.get("earningsGrowth"))
+        yoy_growth = _to_float_or_none(info.get("earningsQuarterlyGrowth"))
+        trailing_pe = _to_float_or_none(info.get("trailingPE"))
+        forward_pe = _to_float_or_none(info.get("forwardPE"))
+        per_value = trailing_pe if trailing_pe is not None else forward_pe
+
+        if forecast_growth is not None or yoy_growth is not None or per_value is not None:
+            return {
+                "forecast_eps_growth": forecast_growth,
+                "eps_growth_yoy": yoy_growth,
+                # yfinance does not provide a clear 3Y EPS CAGR for all symbols.
+                # Use annual earnings growth as a practical fallback proxy.
+                "eps_growth_3y_avg": forecast_growth,
+                "per": per_value,
+            }
+
+    return {
+        "forecast_eps_growth": None,
+        "eps_growth_yoy": None,
+        "eps_growth_3y_avg": None,
+        "per": None,
+    }
+
+
+def _calculate_peg(per: Optional[float], forecast_eps_growth: Optional[float]):
+    if per is None or forecast_eps_growth is None:
+        return None
+    if forecast_eps_growth <= 0:
+        return None
+    growth_percent = forecast_eps_growth * 100
+    if growth_percent == 0:
+        return None
+    return per / growth_percent
 
 
 def update_minkabu_forecasts_all():
@@ -1443,17 +1895,6 @@ def update_minkabu_forecasts_all():
     failed = []
 
     for stock_id, code in stock_rows:
-        exists = con.execute(
-            """
-            SELECT 1
-            FROM minkabu_forecasts
-            WHERE stock_id = ? AND fetched_date = ?
-            """,
-            [stock_id, today],
-        ).fetchone()
-        if exists:
-            skipped += 1
-            continue
 
         code_text = str(code or "").strip()
         if not code_text:
@@ -1462,10 +1903,12 @@ def update_minkabu_forecasts_all():
 
         minkabu_code = re.sub(r"\.T$", "", code_text)
         analysis_url = f"https://minkabu.jp/stock/{minkabu_code}/analysis"
+        stock_url = f"https://minkabu.jp/stock/{minkabu_code}"
         json_url = f"https://assets.minkabu.jp/jsons/stock-jam/stocks/{minkabu_code}/lump.json"
 
         prices = {}
         ratings = {}
+        valuation = {}
 
         try:
             json_res = requests.get(
@@ -1491,11 +1934,35 @@ def update_minkabu_forecasts_all():
             if html_res.status_code == 200:
                 ratings = _extract_minkabu_ratings(html_res.text)
             else:
-                failed.append({"stock_id": stock_id, "code": code_text, "reason": f"HTML HTTP {html_res.status_code}"})
-                continue
-        except Exception as e:
-            failed.append({"stock_id": stock_id, "code": code_text, "reason": f"HTML error: {e}"})
-            continue
+                ratings = {}
+        except Exception:
+            ratings = {}
+
+        try:
+            stock_res = requests.get(
+                stock_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=20,
+            )
+            if stock_res.status_code == 200:
+                valuation["per"] = _extract_minkabu_per(stock_res.text)
+            else:
+                valuation["per"] = None
+        except Exception:
+            valuation["per"] = None
+
+        eps_metrics = _compute_eps_growth_metrics(con, stock_id, code_text)
+        yf_growth_metrics = _fetch_yfinance_growth_metrics(code_text)
+
+        if eps_metrics.get("eps_growth_yoy") is None:
+            eps_metrics["eps_growth_yoy"] = yf_growth_metrics.get("eps_growth_yoy")
+        if eps_metrics.get("eps_growth_3y_avg") is None:
+            eps_metrics["eps_growth_3y_avg"] = yf_growth_metrics.get("eps_growth_3y_avg")
+
+        forecast_eps_growth = yf_growth_metrics.get("forecast_eps_growth")
+        per_value = valuation.get("per")
+        if per_value is None:
+            per_value = yf_growth_metrics.get("per")
 
         data = {
             "target_price": prices.get("target_price"),
@@ -1505,6 +1972,11 @@ def update_minkabu_forecasts_all():
             "individual_rating": ratings.get("individual_rating"),
             "analyst_price": None,
             "analyst_rating": ratings.get("analyst_rating"),
+            "eps_growth_yoy": eps_metrics.get("eps_growth_yoy"),
+            "eps_growth_3y_avg": eps_metrics.get("eps_growth_3y_avg"),
+            "forecast_eps_growth": forecast_eps_growth,
+            "per": per_value,
+            "peg": _calculate_peg(per_value, forecast_eps_growth),
         }
 
         if all(value is None for value in data.values()):
@@ -1513,8 +1985,25 @@ def update_minkabu_forecasts_all():
 
         con.execute(
             """
-            INSERT OR REPLACE INTO minkabu_forecasts
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO minkabu_forecasts (
+                stock_id,
+                target_price,
+                target_rating,
+                theoretical_price,
+                individual_price,
+                individual_rating,
+                analyst_price,
+                analyst_rating,
+                eps_growth_yoy,
+                eps_growth_3y_avg,
+                forecast_eps_growth,
+                peg,
+                per,
+                fetched_date,
+                source_url,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 stock_id,
@@ -1525,6 +2014,11 @@ def update_minkabu_forecasts_all():
                 data.get("individual_rating"),
                 data.get("analyst_price"),
                 data.get("analyst_rating"),
+                data.get("eps_growth_yoy"),
+                data.get("eps_growth_3y_avg"),
+                data.get("forecast_eps_growth"),
+                data.get("peg"),
+                data.get("per"),
                 today,
                 analysis_url,
                 datetime.now(),

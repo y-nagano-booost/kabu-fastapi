@@ -1,6 +1,5 @@
 import { Link } from "react-router-dom"
 import { Fragment, type MouseEvent, useMemo, useState } from "react"
-import StockForm from "./StockForm"
 
 type Stock = {
   id: number
@@ -23,7 +22,10 @@ type Stock = {
   rsi30?: number | null
   rsi60?: number | null
   beta?: number | null
+  beta_3m?: number | null
   beta_calc_date?: string | null
+  fiscal_year_end_month?: number | null
+  current_fiscal_quarter?: number | null
   minkabu_target_price?: number | null
   minkabu_target_rating?: string | null
   minkabu_theoretical_price?: number | null
@@ -31,6 +33,11 @@ type Stock = {
   minkabu_individual_rating?: string | null
   minkabu_analyst_price?: number | null
   minkabu_analyst_rating?: string | null
+  minkabu_eps_growth_yoy?: number | null
+  minkabu_eps_growth_3y_avg?: number | null
+  minkabu_forecast_eps_growth?: number | null
+  minkabu_peg?: number | null
+  minkabu_per?: number | null
   minkabu_fetched_date?: string | null
   kabutan_total_yield?: number | null
   kabutan_benefit_yield?: number | null
@@ -49,7 +56,6 @@ type Trade = {
 
 type Props = {
   stocks: Stock[]
-  onAdd: (code: string, name: string, industry: string, favorite: boolean) => Promise<void>
   onUpdate: (stock: Stock) => void
   onDelete: (id: number) => void
   onAddTrade: (
@@ -61,9 +67,66 @@ type Props = {
   ) => Promise<void>
   onFetchTrades: (stockId: number) => Promise<Trade[]>
   onDeleteTrade: (stockId: number, createdAt: string) => Promise<void>
+  isRightSidebarOpen: boolean
 }
 
-export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTrade, onFetchTrades, onDeleteTrade }: Props) {
+type RangeFilterKey =
+  | "latest_close"
+  | "change_percent"
+  | "rsi14"
+  | "rsi30"
+  | "rsi60"
+  | "beta"
+  | "beta_3m"
+  | "minkabu_eps_growth_yoy"
+  | "minkabu_eps_growth_3y_avg"
+  | "minkabu_forecast_eps_growth"
+  | "minkabu_peg"
+  | "minkabu_per"
+  | "kabutan_dividend_yield"
+  | "kabutan_benefit_yield"
+  | "kabutan_total_yield"
+
+type RangeFilterState = Record<RangeFilterKey, { min: string; max: string }>
+
+const RANGE_FILTER_DEFS: Array<{ key: RangeFilterKey; label: string }> = [
+  { key: "latest_close", label: "最新株価" },
+  { key: "change_percent", label: "前日比率(%)" },
+  { key: "rsi14", label: "RSI14" },
+  { key: "rsi30", label: "RSI30" },
+  { key: "rsi60", label: "RSI60" },
+  { key: "beta", label: "市場連動係数(長期)" },
+  { key: "beta_3m", label: "市場連動係数(3か月)" },
+  { key: "minkabu_eps_growth_yoy", label: "EPS成長(前年同期比)(%)" },
+  { key: "minkabu_eps_growth_3y_avg", label: "EPS成長(3年平均)(%)" },
+  { key: "minkabu_forecast_eps_growth", label: "予想EPS成長(%)" },
+  { key: "minkabu_peg", label: "PEG" },
+  { key: "minkabu_per", label: "PER" },
+  { key: "kabutan_dividend_yield", label: "配当利回り(%)" },
+  { key: "kabutan_benefit_yield", label: "優待利回り(%)" },
+  { key: "kabutan_total_yield", label: "配当+優待(%)" },
+]
+
+const PERCENT_RATIO_RANGE_KEYS: RangeFilterKey[] = [
+  "minkabu_eps_growth_yoy",
+  "minkabu_eps_growth_3y_avg",
+  "minkabu_forecast_eps_growth",
+]
+
+const createInitialRangeFilters = (): RangeFilterState =>
+  Object.fromEntries(
+    RANGE_FILTER_DEFS.map((def) => [def.key, { min: "", max: "" }])
+  ) as RangeFilterState
+
+export default function StockTable({
+  stocks,
+  onUpdate,
+  onDelete,
+  onAddTrade,
+  onFetchTrades,
+  onDeleteTrade,
+  isRightSidebarOpen,
+}: Props) {
   const [editedRows, setEditedRows] = useState<Record<number, Stock>>({})
   const [sortKey, setSortKey] = useState<keyof Stock>("code")
   const [sortAsc, setSortAsc] = useState(true)
@@ -71,14 +134,14 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
   const [buyTargetOnly, setBuyTargetOnly] = useState(false)
   const [sellTargetOnly, setSellTargetOnly] = useState(false)
   const [industryFilter, setIndustryFilter] = useState("")
+  const [fiscalMonthFilters, setFiscalMonthFilters] = useState<number[]>([])
   const [keyword, setKeyword] = useState("")
   const [targetRatingFilter, setTargetRatingFilter] = useState<string[]>([])
   const [individualRatingFilter, setIndividualRatingFilter] = useState<string[]>([])
   const [analystRatingFilter, setAnalystRatingFilter] = useState<string[]>([])
-  const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
-  const [isFiltersVisible, setIsFiltersVisible] = useState(true)
+  const [rangeFilters, setRangeFilters] = useState<RangeFilterState>(createInitialRangeFilters)
   const [tradeFormOpenId, setTradeFormOpenId] = useState<number | null>(null)
-  const [isCompactView, setIsCompactView] = useState(false)
+  const [isCompactView, setIsCompactView] = useState(true)
   const [rowDetailMode, setRowDetailMode] = useState<Record<number, boolean>>({})
   const [tradeDate, setTradeDate] = useState("")
   const [tradeSide, setTradeSide] = useState<"buy" | "sell">("buy")
@@ -101,6 +164,12 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
       result = result.filter((s) => s.industry === industryFilter)
     }
 
+    if (fiscalMonthFilters.length > 0) {
+      result = result.filter(
+        (s) => s.fiscal_year_end_month != null && fiscalMonthFilters.includes(s.fiscal_year_end_month)
+      )
+    }
+
     if (keyword) {
       result = result.filter(
         (s) =>
@@ -117,6 +186,25 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
     }
     if (analystRatingFilter.length > 0) {
       result = result.filter((s) => analystRatingFilter.includes(s.minkabu_analyst_rating ?? ""))
+    }
+
+    for (const { key } of RANGE_FILTER_DEFS) {
+      const minRaw = rangeFilters[key].min.trim()
+      const maxRaw = rangeFilters[key].max.trim()
+      if (!minRaw && !maxRaw) continue
+
+      const isPercentRatio = PERCENT_RATIO_RANGE_KEYS.includes(key)
+      const min = minRaw === "" ? null : (isPercentRatio ? Number(minRaw) / 100 : Number(minRaw))
+      const max = maxRaw === "" ? null : (isPercentRatio ? Number(maxRaw) / 100 : Number(maxRaw))
+      if ((min !== null && Number.isNaN(min)) || (max !== null && Number.isNaN(max))) continue
+
+      result = result.filter((s) => {
+        const value = s[key]
+        if (value === null || value === undefined) return false
+        if (min !== null && value < min) return false
+        if (max !== null && value > max) return false
+        return true
+      })
     }
 
     const isBuyTarget = (s: Stock) =>
@@ -183,10 +271,12 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
     buyTargetOnly,
     sellTargetOnly,
     industryFilter,
+    fiscalMonthFilters,
     keyword,
     targetRatingFilter,
     individualRatingFilter,
     analystRatingFilter,
+    rangeFilters,
   ])
 
   const handleSort = (key: keyof Stock) => {
@@ -265,6 +355,11 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
     return `${Number(value).toFixed(digits)}%`
   }
 
+  const fmtRatioPercent = (value?: number | null, digits = 2) => {
+    if (value === null || value === undefined) return "-"
+    return `${(Number(value) * 100).toFixed(digits)}%`
+  }
+
   const fmtDate = (value?: string | null) => {
     if (!value) return ""
     return value.slice(0, 10)
@@ -275,6 +370,13 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
     const diff = value - base
     const sign = diff > 0 ? "+" : ""
     return `${sign}${fmtNumber(diff, 0)}`
+  }
+
+  const fmtPegLabel = (value?: number | null) => {
+    if (value === null || value === undefined) return "-"
+    if (value <= 0.9) return `割安(${fmtFixed(value, 2)})`
+    if (value < 1.1) return `妥当(${fmtFixed(value, 2)})`
+    return `割高(${fmtFixed(value, 2)})`
   }
 
   const getTheorySignal = (theory?: number | null, current?: number | null) => {
@@ -365,6 +467,26 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
     setRowDetail(stockId, true)
   }
 
+  const toggleFiscalMonthFilter = (month: number) => {
+    setFiscalMonthFilters((prev) =>
+      prev.includes(month) ? prev.filter((m) => m !== month) : [...prev, month].sort((a, b) => a - b)
+    )
+  }
+
+  const handleRangeChange = (key: RangeFilterKey, bound: "min" | "max", value: string) => {
+    setRangeFilters((prev) => ({
+      ...prev,
+      [key]: {
+        ...prev[key],
+        [bound]: value,
+      },
+    }))
+  }
+
+  const clearRangeFilters = () => {
+    setRangeFilters(createInitialRangeFilters())
+  }
+
   const handleCompactFavoriteChange = (stock: Stock, checked: boolean) => {
     onUpdate({
       ...stock,
@@ -379,7 +501,7 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
     })
   }
 
-  const tableColumnCount = 11
+  const tableColumnCount = 15
 
   const renderActionStack = (stockId: number, isEdited: boolean, isDetailRow: boolean) => (
     <div className="action-stack">
@@ -417,20 +539,12 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
   )
 
   return (
-    <div className="card">
-      {/* フィルタエリア */}
-      <section className="panel">
+    <div className={`card stock-table-card ${isRightSidebarOpen ? "with-right-sidebar" : "without-right-sidebar"}`}>
+      {isRightSidebarOpen && (
+      <section className="panel right-menu-panel">
       <div className="panel-header">
         <h3 className="panel-title">{"\u30d5\u30a3\u30eb\u30bf"}</h3>
-        <button
-          type="button"
-          className="panel-toggle"
-          onClick={() => setIsFiltersVisible((prev) => !prev)}
-        >
-          {isFiltersVisible ? "\u975e\u8868\u793a" : "\u8868\u793a"}
-        </button>
       </div>
-      {isFiltersVisible && (
 <div className="filters">
         <div className="filter-row">
           <div className="filter-block">
@@ -455,6 +569,21 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
               ))}
             </select>
           </div>
+          <div className="filter-block">
+            <label className="filter-label">決算月（複数選択）</label>
+            <div className="filter-chip-group">
+              {Array.from({ length: 12 }, (_, i) => i + 1).map((month) => (
+                <button
+                  key={`fiscal-${month}`}
+                  type="button"
+                  className={`filter-chip ${fiscalMonthFilters.includes(month) ? "is-active" : ""}`}
+                  onClick={() => toggleFiscalMonthFilter(month)}
+                >
+                  {month}月
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="filter-block filter-inline">
             <label className="filter-label">表示</label>
             <label className="filter-check">
@@ -466,83 +595,103 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
               ★のみ
             </label>
           </div>
-          <button
-            type="button"
-            className="filter-toggle"
-            onClick={() => setIsAdvancedOpen((prev) => !prev)}
-          >
-            {isAdvancedOpen ? "詳細フィルタを閉じる" : "詳細フィルタを開く"}
-          </button>
-
         </div>
 
-        {isAdvancedOpen && (
-          <div className="filter-advanced">
-            <div className="filter-chip-group">
-              <span className="filter-chip-label">{"\u30bf\u30fc\u30b2\u30c3\u30c8"}</span>
-              <label className="filter-check">
-                <input
-                  type="checkbox"
-                  checked={buyTargetOnly}
-                  onChange={(e) => setBuyTargetOnly(e.target.checked)}
-                />
-                {"\u8cb7\u3044\u72d9\u3044"}
-              </label>
-              <label className="filter-check">
-                <input
-                  type="checkbox"
-                  checked={sellTargetOnly}
-                  onChange={(e) => setSellTargetOnly(e.target.checked)}
-                />
-                {"\u58f2\u308a\u72d9\u3044"}
-              </label>
-            </div>
-            <div className="filter-chip-group">
-              <span className="filter-chip-label">目標評価</span>
-              {sortedRatingOptions.map((r) => (
-                <button
-                  key={`target-${r}`}
-                  type="button"
-                  className={`filter-chip ${targetRatingFilter.includes(r) ? "is-active" : ""}`}
-                  onClick={() => toggleRating(targetRatingFilter, r, setTargetRatingFilter)}
-                >
-                  {r}
-                </button>
-              ))}
-            </div>
-            <div className="filter-chip-group">
-              <span className="filter-chip-label">個人評価</span>
-              {sortedRatingOptions.map((r) => (
-                <button
-                  key={`individual-${r}`}
-                  type="button"
-                  className={`filter-chip ${individualRatingFilter.includes(r) ? "is-active" : ""}`}
-                  onClick={() => toggleRating(individualRatingFilter, r, setIndividualRatingFilter)}
-                >
-                  {r}
-                </button>
-              ))}
-            </div>
-            <div className="filter-chip-group">
-              <span className="filter-chip-label">アナ評価</span>
-              {sortedRatingOptions.map((r) => (
-                <button
-                  key={`analyst-${r}`}
-                  type="button"
-                  className={`filter-chip ${analystRatingFilter.includes(r) ? "is-active" : ""}`}
-                  onClick={() => toggleRating(analystRatingFilter, r, setAnalystRatingFilter)}
-                >
-                  {r}
-                </button>
-              ))}
-            </div>
+        <div className="filter-advanced always-open">
+          <div className="filter-chip-group">
+            <span className="filter-chip-label">{"\u30bf\u30fc\u30b2\u30c3\u30c8"}</span>
+            <label className="filter-check">
+              <input
+                type="checkbox"
+                checked={buyTargetOnly}
+                onChange={(e) => setBuyTargetOnly(e.target.checked)}
+              />
+              {"\u8cb7\u3044\u72d9\u3044"}
+            </label>
+            <label className="filter-check">
+              <input
+                type="checkbox"
+                checked={sellTargetOnly}
+                onChange={(e) => setSellTargetOnly(e.target.checked)}
+              />
+              {"\u58f2\u308a\u72d9\u3044"}
+            </label>
           </div>
-        )}
+          <div className="filter-chip-group">
+            <span className="filter-chip-label">目標評価</span>
+            {sortedRatingOptions.map((r) => (
+              <button
+                key={`target-${r}`}
+                type="button"
+                className={`filter-chip ${targetRatingFilter.includes(r) ? "is-active" : ""}`}
+                onClick={() => toggleRating(targetRatingFilter, r, setTargetRatingFilter)}
+              >
+                {r}
+              </button>
+            ))}
+          </div>
+          <div className="filter-chip-group">
+            <span className="filter-chip-label">個人評価</span>
+            {sortedRatingOptions.map((r) => (
+              <button
+                key={`individual-${r}`}
+                type="button"
+                className={`filter-chip ${individualRatingFilter.includes(r) ? "is-active" : ""}`}
+                onClick={() => toggleRating(individualRatingFilter, r, setIndividualRatingFilter)}
+              >
+                {r}
+              </button>
+            ))}
+          </div>
+          <div className="filter-chip-group">
+            <span className="filter-chip-label">アナ評価</span>
+            {sortedRatingOptions.map((r) => (
+              <button
+                key={`analyst-${r}`}
+                type="button"
+                className={`filter-chip ${analystRatingFilter.includes(r) ? "is-active" : ""}`}
+                onClick={() => toggleRating(analystRatingFilter, r, setAnalystRatingFilter)}
+              >
+                {r}
+              </button>
+            ))}
+          </div>
+          <div className="filter-range-grid">
+            <div className="filter-range-row filter-range-head">
+              <span className="range-label">項目</span>
+              <span className="range-min">min</span>
+              <span className="range-max">max</span>
+            </div>
+            {RANGE_FILTER_DEFS.map((def) => (
+              <div key={def.key} className="filter-range-row">
+                <label className="range-label" htmlFor={`range-${def.key}-min`}>{def.label}</label>
+                <input
+                  id={`range-${def.key}-min`}
+                  className="range-min"
+                  type="number"
+                  step="0.01"
+                  value={rangeFilters[def.key].min}
+                  onChange={(e) => handleRangeChange(def.key, "min", e.target.value)}
+                />
+                <input
+                  className="range-max"
+                  type="number"
+                  step="0.01"
+                  value={rangeFilters[def.key].max}
+                  onChange={(e) => handleRangeChange(def.key, "max", e.target.value)}
+                />
+              </div>
+            ))}
+          </div>
+          <button type="button" className="filter-toggle filter-clear" onClick={clearRangeFilters}>
+            min/max をクリア
+          </button>
+        </div>
       </div>
-      )}
     </section>
+      )}
 
-      <StockForm onAdd={onAdd} />
+      <div className="table-main">
       <button
         type="button"
         className="filter-toggle"
@@ -560,6 +709,12 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                 <button type="button" className="header-action" onClick={() => handleSort("code")}>{"銘柄コード"}</button>
                 <button type="button" className="header-action header-muted" onClick={() => handleSort("industry")}>{"業種"}</button>
                 <button type="button" className="header-action" onClick={() => handleSort("name")}>{"銘柄名"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("fiscal_year_end_month")}>{"決算月"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("current_fiscal_quarter")}>{"現在四半期"}</button>
               </div>
             </th>
             <th>
@@ -597,7 +752,13 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
             </th>
             <th>
               <div className="header-stack">
-                <button type="button" className="header-action" onClick={() => handleSort("beta")}>{"β(週次)"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("beta")}>{"市場連動係数(長期)"}</button>
+                <button type="button" className="header-action header-muted" onClick={() => handleSort("beta_calc_date")}>{"計算日"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("beta_3m")}>{"市場連動係数(3か月)"}</button>
                 <button type="button" className="header-action header-muted" onClick={() => handleSort("beta_calc_date")}>{"計算日"}</button>
               </div>
             </th>
@@ -607,6 +768,19 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                 <button type="button" className="header-action" onClick={() => handleSort("minkabu_theoretical_price")}>{"理論株価"}</button>
                 <button type="button" className="header-action" onClick={() => handleSort("minkabu_individual_rating")}>{"個人評価：個人予想株価"}</button>
                 <button type="button" className="header-action" onClick={() => handleSort("minkabu_analyst_rating")}>{"アナリスト評価：予想株価"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("minkabu_eps_growth_yoy")}>{"EPS成長(前年同期比)"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("minkabu_eps_growth_3y_avg")}>{"3年平均"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("minkabu_forecast_eps_growth")}>{"予想EPS"}</button>
+              </div>
+            </th>
+            <th>
+              <div className="header-stack">
+                <button type="button" className="header-action" onClick={() => handleSort("minkabu_peg")}>{"PEG"}</button>
+                <button type="button" className="header-action" onClick={() => handleSort("minkabu_per")}>{"PER"}</button>
               </div>
             </th>
             <th>
@@ -649,6 +823,11 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                         {row.name}
                       </td>
                       <td className="compact-value-cell">
+                        {stock.fiscal_year_end_month == null && stock.current_fiscal_quarter == null
+                          ? "-"
+                          : `${stock.fiscal_year_end_month == null ? "-" : `${stock.fiscal_year_end_month}月`} / ${stock.current_fiscal_quarter == null ? "-" : `Q${stock.current_fiscal_quarter}`}`}
+                      </td>
+                      <td className="compact-value-cell">
                         <span className="highlight-value">{fmtNumber(stock.latest_close)}</span>
                       </td>
                       <td className="compact-value-cell">
@@ -666,10 +845,19 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                       <td className="compact-value-cell">
                         {fmtFixed(stock.beta)}
                       </td>
+                      <td className="compact-value-cell">
+                        {fmtFixed(stock.beta_3m)}
+                      </td>
                       <td className="compact-rating-cell">
                         <span className={`cell-badge ${getRatingClass(stock.minkabu_target_rating)}`}>
                           {stock.minkabu_target_rating ?? "-"}
                         </span>
+                      </td>
+                      <td className="compact-value-cell">
+                        {fmtRatioPercent(stock.minkabu_eps_growth_yoy, 1)}
+                      </td>
+                      <td className="compact-value-cell">
+                        {fmtPegLabel(stock.minkabu_peg)}
                       </td>
                       <td className="compact-value-cell">
                         {fmtPercent(stock.kabutan_total_yield, 2)}
@@ -722,6 +910,18 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                     </div>
                   </td>
 
+                  <td>
+                    <div className="cell-stack compact-stack">
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"決算月"}</span>
+                        <span>{stock.fiscal_year_end_month == null ? "-" : `${stock.fiscal_year_end_month}月`}</span>
+                      </div>
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"現在四半期"}</span>
+                        <span>{stock.current_fiscal_quarter == null ? "-" : `Q${stock.current_fiscal_quarter}`}</span>
+                      </div>
+                    </div>
+                  </td>
                   <td>
                     <div className="cell-stack compact-stack">
                       <div className="cell-line highlight-line">
@@ -790,6 +990,16 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                   </td>
                   <td>
                     <div className="cell-stack compact-stack">
+                      <div className="cell-line highlight-line">
+                        <span className="highlight-value">{fmtFixed(stock.beta_3m)}</span>
+                      </div>
+                      <div className="cell-line">
+                        <span className="cell-date">{fmtDate(stock.beta_calc_date)}</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="cell-stack compact-stack">
                       <div className="cell-line">
                         <span className={`cell-badge ${getRatingClass(stock.minkabu_target_rating)}`}>{stock.minkabu_target_rating ?? "-"}</span>
                         <span>{fmtNumber(stock.minkabu_target_price, 0)}</span>
@@ -816,6 +1026,34 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
                       <div className="cell-line">
                         <span className={`cell-badge ${getRatingClass(stock.minkabu_analyst_rating)}`}>{stock.minkabu_analyst_rating ?? "-"}</span>
                         <span className="cell-date">{fmtDate(stock.minkabu_fetched_date)}</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="cell-stack compact-stack">
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"前年同期比"}</span>
+                        <span>{fmtRatioPercent(stock.minkabu_eps_growth_yoy, 2)}</span>
+                      </div>
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"3年平均"}</span>
+                        <span>{fmtRatioPercent(stock.minkabu_eps_growth_3y_avg, 2)}</span>
+                      </div>
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"予想EPS"}</span>
+                        <span>{fmtRatioPercent(stock.minkabu_forecast_eps_growth, 2)}</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="cell-stack compact-stack">
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"PEG"}</span>
+                        <span>{fmtPegLabel(stock.minkabu_peg)}</span>
+                      </div>
+                      <div className="cell-line">
+                        <span className="cell-label-inline">{"PER"}</span>
+                        <span>{fmtFixed(stock.minkabu_per, 2)}</span>
                       </div>
                     </div>
                   </td>
@@ -928,6 +1166,7 @@ export default function StockTable({ stocks, onAdd, onUpdate, onDelete, onAddTra
         </tbody>
       </table>
     </div>
+  </div>
   </div>
   )
 }
